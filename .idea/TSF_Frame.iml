@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<module type="PYTHON_MODULE" version="4">
+  <component name="NewModuleRootManager">
+    <content url="file://$MODULE_DIR$">
+      <!-- src-layout: src 目录下的 tsf_frame 是可导入的顶层包 -->
+      <sourceFolder url="file://$MODULE_DIR$/src" isTestSource="false" />
+      <!-- 顶层 configs / pipelines 也是可导入包 -->
+      <sourceFolder url="file://$MODULE_DIR$/configs" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/pipelines" isTestSource="false" />
+      <!-- tests 标为测试源 -->
+      <sourceFolder url="file://$MODULE_DIR$/tests" isTestSource="true" />
+      <!-- 运行产物 / 数据 / 构建输出不参与索引 -->
+      <excludeFolder url="file://$MODULE_DIR$/data" />
+      <excludeFolder url="file://$MODULE_DIR$/experiments" />
+      <excludeFolder url="file://$MODULE_DIR$/logs" />
+      <excludeFolder url="file://$MODULE_DIR$/build" />
+      <excludeFolder url="file://$MODULE_DIR$/dist" />
+      <excludeFolder url="file://$MODULE_DIR$/src/tsf_frame.egg-info" />
+      <excludeFolder url="file://$MODULE_DIR$/tsf_frame.egg-info" />
+    </content>
+    <orderEntry type="jdk" jdkName="tsf_env" jdkType="Python SDK" />
+    <orderEntry type="sourceFolder" forTests="false" />
+  </component>
+  <component name="PyDocumentationSettings">
+    <option name="format" value="GOOGLE" />
+    <option name="myDocStringFormat" value="Google" />
+  </component>
+</module>

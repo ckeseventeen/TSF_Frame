@@ -1,0 +1,26 @@
+{
+    "include": [
+        "src",
+        "configs",
+        "pipelines",
+        "tests"
+    ],
+    "exclude": [
+        "**/__pycache__",
+        "**/*.egg-info",
+        "build",
+        "dist",
+        "data",
+        "experiments",
+        "logs"
+    ],
+    "extraPaths": [
+        "src",
+        "."
+    ],
+    "pythonVersion": "3.10",
+    "reportMissingImports": "warning",
+    "reportMissingTypeStubs": "none",
+    "venvPath": ".",
+    "venv": ".venv"
+}
