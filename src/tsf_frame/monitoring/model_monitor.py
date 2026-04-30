@@ -106,7 +106,8 @@ class ModelMonitor(BaseMonitor):
         retraining_trigger: Optional[RetrainingTrigger] = None,
         target_name: str = 'y',
         cold_start_samples: int = 20,   # 冷启动样本数
-        window_size: int = 100,             # 业务计算窗口
+        window_size: int = 100,             # PerformanceMonitor 队列容量
+        metric_window: int = 12,            # 指标计算窗口 (近 N 条已 settle 的记录)
         history_size: int = 20000,           # 事件留底缓冲
     ):
         super().__init__(model_id, history_size=history_size)
@@ -116,7 +117,11 @@ class ModelMonitor(BaseMonitor):
             alert_manager or AlertManager(model_id, store=self.store)
         )
         self.perf: PerformanceMonitor = performance_monitor or \
-            PerformanceMonitor(model_id, window_size=window_size)
+            PerformanceMonitor(
+                model_id,
+                window_size=window_size,
+                metric_window=metric_window,
+            )
         self.data_quality = data_quality
         self.data_drift = data_drift
         self.concept_drift: ConceptDriftDetector = (
@@ -417,14 +422,14 @@ class ModelMonitor(BaseMonitor):
 
         final_level = level_max(*levels)
 
-        # 写快照
+        # 写快照 (window 字段记录的是"指标计算窗口", 而非"队列容量")
         try:
             self.store.insert_metrics_snapshot(
                 model_id=self.model_id, timestamp=now,
                 metrics={k: v for k, v in metrics.items()
                          if isinstance(v, (int, float))
                          and not (isinstance(v, float) and np.isnan(v))},
-                window=self.perf.window_size,
+                window=self.perf.metric_window,
             )
         except Exception:  # pragma: no cover
             pass

@@ -9,7 +9,7 @@
 该脚本是一个最小可运行骨架, 作为业务团队二次开发的起点:
   - 读取 `--model` 指定的模型名, 使用 models/__init__.py 里的工厂函数
   - 读取 `--dataset` 指定的公开数据集, 使用 tsf_frame.data.datasets.public_datasets.get_dataset
-  - 划分训练/测试, 输出 metrics 到 stdout, 模型权重保存到 `experiments/checkpoints/`
+  - 划分训练/测试, 输出 metrics 到 stdout, 模型权重保存到 `logs/models/`
 
 真实生产场景下, 请把 `--config <path>` 支持加进来（读取 configs/xxx），
 并把数据来源替换为 business/<name>_adapter.py 中的 preprocess 接口。
@@ -50,13 +50,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--dataset', required=True, help='public dataset name, e.g. airpassengers')
     p.add_argument('--test-size', type=float, default=0.2)
     p.add_argument('--epochs', type=int, default=10, help='DL-only: number of training epochs')
-    p.add_argument('--output-dir', default='experiments/checkpoints')
+    p.add_argument('--output-dir', default='logs/models')
     return p.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    logger = get_logger('train_model', log_dir='logs')
+    logger = get_logger('train_model', log_dir='logs/runs')
     logger.info('Trainer started: model=%s dataset=%s', args.model, args.dataset)
 
     from tsf_frame.data.datasets.public_datasets import get_dataset

@@ -198,9 +198,18 @@ class PerformanceMonitor:
     2. ``fill_actual(target_ts, y_true)`` 在真值到达时回填;
     3. ``current()`` 仅基于已回填的记录计算指标。
 
+    **两层窗口**:
+    * ``window_size``   — *存储* 容量, 队列里最多保留多少 target_ts
+                          (越大可追溯历史越长, 但内存占用越多)
+    * ``metric_window`` — *计算* 窗口, 算指标时只取最近 N 条已回填的记录
+                          (HPF 月度场景默认 12, 即"近 12 个月")
+
+    保证 ``metric_window <= window_size``, 否则 clamp 并警告。
+
     Args:
         model_id:       模型标识
-        window_size:    保留最近多少个 ``target_ts`` 的记录
+        window_size:    存储队列容量, 默认 100
+        metric_window:  指标计算窗口, 默认 12 (近 12 期); 必须 <= window_size
         metrics:        要计算的指标名列表, 默认 [mae, mape, rmse, r2]
         baseline:       基线指标字典, 便于 compare_to_baseline
         probabilistic:  若为 True, 强制计算 picp/miw/winkler (自动追加)
@@ -214,12 +223,30 @@ class PerformanceMonitor:
         model_id: str,
         *,
         window_size: int = 100,
+        metric_window: int = 12,
         metrics: Optional[List[str]] = None,
         baseline: Optional[Mapping[str, float]] = None,
         probabilistic: bool = False,
     ):
         self.model_id = model_id
         self.window_size = int(window_size)
+
+        # 校验 metric_window
+        mw = int(metric_window)
+        if mw <= 0:
+            raise ValueError(
+                f'metric_window 必须 > 0, 实际 {mw}'
+            )
+        if mw > self.window_size:
+            warnings.warn(
+                f'metric_window={mw} 超过 window_size={self.window_size}, '
+                f'已 clamp 到 {self.window_size}. '
+                f'建议 metric_window <= window_size.',
+                RuntimeWarning, stacklevel=2,
+            )
+            mw = self.window_size
+        self.metric_window: int = mw
+
         self.baseline: Dict[str, float] = dict(baseline or {})
         self.probabilistic = probabilistic
         self.metric_names: List[str] = list(metrics or self.DEFAULT_METRICS)
@@ -324,17 +351,29 @@ class PerformanceMonitor:
         """列出已记录但 y_true 还未回填的 target_ts (按时间)。"""
         return [ts for ts, r in self._records.items() if r.y_true is None]
 
-    def current(self) -> Dict[str, float]:
+    def current(self, window: Optional[int] = None) -> Dict[str, float]:
         """
-        计算当前窗口指标 / Compute all metrics from settled records only.
+        计算指标 / Compute metrics over the latest ``window`` settled records.
 
-        只用 ``y_true is not None`` 的记录, 顺序按 target_ts 插入序。
+        Args:
+            window: 临时覆盖 ``self.metric_window``; None 则用默认。
+                    取值会被 clamp 到 [1, window_size]。
+
+        只用 ``y_true is not None`` 的记录, 按 target_ts 插入序取最近 N 条。
+        若全部未回填, 返回 NaN dict。
         """
+        n = int(window) if window is not None else self.metric_window
+        n = max(1, min(n, self.window_size))
+
+        # 取最近 n 个 target_ts (按插入顺序的尾部)
+        recent_keys = list(self._records.keys())[-n:]
+
         ys_true: List[float] = []
         ys_pred: List[float] = []
         ys_lo: List[Optional[float]] = []
         ys_hi: List[Optional[float]] = []
-        for r in self._records.values():
+        for k in recent_keys:
+            r = self._records[k]
             if r.y_true is None:
                 continue
             ys_true.append(r.y_true)
@@ -371,12 +410,28 @@ class PerformanceMonitor:
                 out[f'{name}__error'] = str(exc)  # type: ignore[assignment]
         return out
 
-    def snapshot(self) -> Dict[str, Any]:
-        """记录当前指标并返回 (用于 check_status 时写入 store)。"""
-        metrics = self.current()
+    def set_metric_window(self, n: int) -> None:
+        """运行时调整指标窗口大小 (会自动 clamp 到 [1, window_size])。"""
+        n = int(n)
+        if n <= 0:
+            raise ValueError(f'metric_window 必须 > 0, 实际 {n}')
+        self.metric_window = min(n, self.window_size)
+
+    def snapshot(self, window: Optional[int] = None) -> Dict[str, Any]:
+        """
+        记录当前指标并返回 (用于 check_status 时写入 store)。
+
+        Args:
+            window: 见 ``current()`` 同名参数。
+        """
+        used_window = (int(window) if window is not None
+                       else self.metric_window)
+        used_window = max(1, min(used_window, self.window_size))
+        metrics = self.current(window=used_window)
         row = {
             'timestamp': datetime.now(),
             'metrics': metrics,
+            'metric_window': used_window,
             'n': len(self._records),
             'n_settled': sum(1 for r in self._records.values()
                              if r.y_true is not None),
@@ -384,14 +439,19 @@ class PerformanceMonitor:
         self.snapshots.append(row)
         return row
 
-    def compare_to_baseline(self) -> Dict[str, float]:
+    def compare_to_baseline(
+        self, window: Optional[int] = None,
+    ) -> Dict[str, float]:
         """
         与基线对比 / Compare current metrics against baseline.
+
+        Args:
+            window: 见 ``current()`` 同名参数。
 
         返回 {metric: relative_change}: 正值表示恶化 (MAE/MAPE 升高) 或
         改善 (R² 升高), 调用方须结合指标语义判断方向。
         """
-        cur = self.current()
+        cur = self.current(window=window)
         out: Dict[str, float] = {}
         for k, base in self.baseline.items():
             if k in cur and base not in (0, None) and not math.isnan(cur[k]):

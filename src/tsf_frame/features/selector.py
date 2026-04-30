@@ -311,28 +311,48 @@ class AutoFeatureEngineer:
         return self
     
     def fit(self, X, y=None):
+        """
+        训练流水线 / Fit the pipeline end-to-end.
+
+        Lag / rolling 等特征工程器会在序列开头引入 NaN, 因此在
+        engineer 阶段结束后会**自动 dropna 并同步 y 的索引**, 否则
+        sklearn 的 selectors 会报 "Input contains NaN"。
+        """
         current_X = X.copy()
-        
+        current_y = y.copy() if y is not None else None
+
         for engineer in self.feature_engineers:
             current_X = engineer.fit_transform(current_X)
-        
+
+        # 关键: 特征工程后 dropna 并同步 y, 避免下游 selector 拿到 NaN
+        if current_X.isna().any().any():
+            valid_mask = ~current_X.isna().any(axis=1)
+            current_X = current_X[valid_mask]
+            if current_y is not None:
+                current_y = current_y.loc[current_X.index]
+
         for selector in self.selectors:
-            current_X = selector.fit_transform(current_X, y)
-        
+            current_X = selector.fit_transform(current_X, current_y)
+
         for reducer in self.reducers:
             current_X = reducer.fit_transform(current_X)
-        
+
         self.pipeline = self.feature_engineers + self.selectors + self.reducers
         return self
-    
+
     def transform(self, X):
         current_X = X.copy()
-        
-        for step in self.pipeline:
+        # 应用所有 engineers
+        for engineer in self.feature_engineers:
+            current_X = engineer.transform(current_X)
+        # engineer 后同样 dropna (与 fit 行为一致)
+        if current_X.isna().any().any():
+            current_X = current_X.dropna()
+        # 应用所有 selectors / reducers
+        for step in (self.selectors + self.reducers):
             current_X = step.transform(current_X)
-        
         return current_X
-    
+
     def fit_transform(self, X, y=None):
         self.fit(X, y)
         return self.transform(X)

@@ -52,13 +52,14 @@ class HPFMonitoringConfig:
     ks_pvalue: float = 0.05
 
     # ── 持久化 ───────────────────────────────────────────────────────────
+    # 统一目录布局: ./logs/{runs,monitor,reports/hpf,outputs}
     # SQLite 数据库路径（相对项目根目录）
-    sqlite_path: str = './logs/hpf_monitor.db'
+    sqlite_path: str = './logs/monitor/hpf_monitor.db'
     # 历史保留月数；cleanup_old 按此裁剪
     retain_months: int = 36
 
     # ── 报表 ─────────────────────────────────────────────────────────────
-    report_dir: str = './logs/hpf_reports'
+    report_dir: str = './logs/reports/hpf'
     # 是否在 WARNING+ 时自动生成报表 PNG
     report_on_alert: bool = True
     report_dpi: int = 120
@@ -66,9 +67,9 @@ class HPFMonitoringConfig:
     # ── 告警通道 ─────────────────────────────────────────────────────────
     # 控制台 + 主日志由 get_logger 输出
     log_name: str = 'hpf_monitor'
-    log_dir: str = './logs'
+    log_dir: str = './logs/runs'
     # 专用告警文件（仅 WARNING 以上）
-    alert_log_file: str = './logs/hpf_alerts.log'
+    alert_log_file: str = './logs/monitor/hpf_alerts.log'
 
     def to_dict(self) -> Dict[str, Any]:
         """序列化为字典（便于日志和调试）"""

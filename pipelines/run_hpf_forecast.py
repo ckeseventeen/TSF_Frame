@@ -345,17 +345,15 @@ def plot_policy_scenario(
 # ─── 5. 主流程 ────────────────────────────────────────────────────────────────
 
 def main():
-    # 输出目录
-    output_dir = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        'experiments', 'results', 'hpf'
-    )
+    # 输出目录 (统一布局: logs/{runs,outputs/...})
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    output_dir = os.path.join(project_root, 'logs', 'outputs', 'hpf')
     os.makedirs(output_dir, exist_ok=True)
 
-    logger = get_logger('hpf_example', log_dir=os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        'experiments', 'logs'
-    ))
+    logger = get_logger(
+        'hpf_example',
+        log_dir=os.path.join(project_root, 'logs', 'runs'),
+    )
 
     logger.info('=' * 65)
     logger.info('  住房公积金（HPF）业务预测示例')

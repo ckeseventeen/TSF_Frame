@@ -103,19 +103,19 @@ def main():
     logger.info(f'生成的特征: {feature_engineer.get_feature_names()}')
     
     logger.info('\n3. 步骤2: 方差选择 (去除低方差特征)...')
-    variance_selector = VarianceSelector({'threshold': 0.01})
+    variance_selector = VarianceSelector(threshold=0.01)
     X_after_variance = variance_selector.fit_transform(X_with_features)
     logger.info(f'方差选择后数据形状: {X_after_variance.shape}')
     logger.info(f'移除的特征: {[f for f in X_with_features.columns if f not in X_after_variance.columns]}')
-    
+
     logger.info('\n4. 步骤3: 相关性选择 (去除高相关性特征)...')
-    corr_selector = CorrelationSelector({'threshold': 0.9})
+    corr_selector = CorrelationSelector(threshold=0.9)
     X_after_corr = corr_selector.fit_transform(X_after_variance)
     logger.info(f'相关性选择后数据形状: {X_after_corr.shape}')
     logger.info(f'移除的特征: {[f for f in X_after_variance.columns if f not in X_after_corr.columns]}')
-    
+
     logger.info('\n5. 步骤4: KBest特征选择 (F值)...')
-    kbest_selector = KBestSelector({'k': 15, 'score_func': 'f_regression'})
+    kbest_selector = KBestSelector(k=15)
     X_kbest = kbest_selector.fit_transform(X_after_corr, y_aligned)
     logger.info(f'KBest选择后数据形状: {X_kbest.shape}')
     logger.info(f'选择的特征: {kbest_selector.get_selected_features()}')
@@ -128,7 +128,7 @@ def main():
             logger.info(f'  {feat}: {imp:.4f}')
     
     logger.info('\n6. 步骤5: Lasso特征选择...')
-    lasso_selector = LassoSelector({'alpha': 0.01})
+    lasso_selector = LassoSelector(alpha=0.01)
     X_lasso = lasso_selector.fit_transform(X_after_corr, y_aligned)
     logger.info(f'Lasso选择后数据形状: {X_lasso.shape}')
     logger.info(f'选择的特征: {lasso_selector.get_selected_features()}')
@@ -142,7 +142,7 @@ def main():
                 logger.info(f'  {feat}: {imp:.4f}')
     
     logger.info('\n7. 步骤6: PCA降维...')
-    pca_reducer = PCAReducer({'n_components': 0.95, 'use_scaler': True})
+    pca_reducer = PCAReducer(n_components=0.95, use_scaler=True)
     X_pca = pca_reducer.fit_transform(X_kbest)
     logger.info(f'PCA降维后数据形状: {X_pca.shape}')
     
@@ -155,9 +155,9 @@ def main():
     auto_fe = AutoFeatureEngineer()
     
     auto_fe.add_feature_engineer(feature_engineer)
-    auto_fe.add_selector(VarianceSelector({'threshold': 0.01}))
-    auto_fe.add_selector(CorrelationSelector({'threshold': 0.9}))
-    auto_fe.add_selector(KBestSelector({'k': 15, 'score_func': 'f_regression'}))
+    auto_fe.add_selector(VarianceSelector(threshold=0.01))
+    auto_fe.add_selector(CorrelationSelector(threshold=0.9))
+    auto_fe.add_selector(KBestSelector(k=15))
     
     X_final = auto_fe.fit_transform(X, y)
     logger.info(f'自动化流水线后数据形状: {X_final.shape}')

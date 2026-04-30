@@ -306,7 +306,7 @@ def build_hpf_monitor(
 # =====================================================================
 
 def main():
-    logger = get_logger('hpf_monitoring_example', log_dir='./logs')
+    logger = get_logger('hpf_monitoring_example', log_dir='./logs/runs')
     logger.info('=' * 70)
     logger.info('  HPF 端到端监控演示 (generic ModelMonitor stack)')
     logger.info('=' * 70)

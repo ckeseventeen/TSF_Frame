@@ -24,7 +24,7 @@ matplotlib.rcParams['axes.unicode_minus'] = False   # 修复负号显示为方�
 class BaseVisualizer(ABC):
     def __init__(self, config: Dict[str, Any]):
         self.config = config
-        self.save_dir = config.get('save_dir', './experiments/results')
+        self.save_dir = config.get('save_dir', './logs/outputs')
         self.save_plots = config.get('save_plots', True)
         self.show_plots = config.get('show_plots', False)
         self.figure_size = config.get('figure_size', (12, 8))

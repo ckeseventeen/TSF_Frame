@@ -152,9 +152,13 @@ class BaseConfig:
     data_dir: str = field(default_factory=lambda: os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data', 'raw'))
     processed_data_dir: str = field(default_factory=lambda: os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data', 'processed'))
     
-    log_dir: str = field(default_factory=lambda: os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'experiments', 'logs'))
-    result_dir: str = field(default_factory=lambda: os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'experiments', 'results'))
-    model_save_dir: str = field(default_factory=lambda: os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'experiments', 'models'))
+    # 统一产出目录布局: <project_root>/logs/{runs,monitor,reports,outputs}/
+    # log_dir       — 运行日志 (*.log)
+    # result_dir    — 训练产物 (PNG/CSV/对比图等)
+    # model_save_dir— 模型权重
+    log_dir: str = field(default_factory=lambda: os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'logs', 'runs'))
+    result_dir: str = field(default_factory=lambda: os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'logs', 'outputs'))
+    model_save_dir: str = field(default_factory=lambda: os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'logs', 'models'))
     
     random_seed: int = 42
     
