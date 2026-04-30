@@ -46,7 +46,7 @@ class BaseMonitor(ABC):
             弹出最老)
     """
 
-    def __init__(self, model_id: str, history_size: int = 10_000):
+    def __init__(self, model_id: str, history_size: int = 10000):
         if not model_id:
             raise ValueError('model_id must be non-empty')
         self.model_id: str = model_id

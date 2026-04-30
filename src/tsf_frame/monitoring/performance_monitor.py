@@ -25,9 +25,11 @@
 from __future__ import annotations
 
 import math
-from collections import deque
+import warnings
+from collections import OrderedDict
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Deque, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
 
 import numpy as np
 
@@ -174,13 +176,31 @@ def winkler(y_true, y_pred=None, y_lower=None, y_upper=None,
 # PerformanceMonitor
 # ==========================================================================
 
+@dataclass
+class _Record:
+    """单条预测记录 / Single prediction record keyed by target_ts."""
+    target_ts: datetime
+    y_pred: float
+    y_true: Optional[float] = None
+    y_lower: Optional[float] = None
+    y_upper: Optional[float] = None
+
+
 class PerformanceMonitor:
     """
     滑窗性能监控 / Sliding-window performance monitor.
 
+    **对齐方式**: 以 ``target_ts`` (预测目标时点) 为唯一键, 不依赖位置
+    索引。多步预测/异步真值回填场景下不会错位。
+
+    生命周期:
+    1. ``update(y_pred, target_ts)`` 在跑批时记录预测 (y_true 留空);
+    2. ``fill_actual(target_ts, y_true)`` 在真值到达时回填;
+    3. ``current()`` 仅基于已回填的记录计算指标。
+
     Args:
         model_id:       模型标识
-        window_size:    保留多少条 (pred, actual, lower, upper) 做滚动指标
+        window_size:    保留最近多少个 ``target_ts`` 的记录
         metrics:        要计算的指标名列表, 默认 [mae, mape, rmse, r2]
         baseline:       基线指标字典, 便于 compare_to_baseline
         probabilistic:  若为 True, 强制计算 picp/miw/winkler (自动追加)
@@ -208,11 +228,9 @@ class PerformanceMonitor:
                 if m not in self.metric_names:
                     self.metric_names.append(m)
 
-        self._y_true: Deque[float] = deque(maxlen=self.window_size)
-        self._y_pred: Deque[float] = deque(maxlen=self.window_size)
-        self._y_lower: Deque[Optional[float]] = deque(maxlen=self.window_size)
-        self._y_upper: Deque[Optional[float]] = deque(maxlen=self.window_size)
-        self._timestamps: Deque[datetime] = deque(maxlen=self.window_size)
+        # target_ts -> _Record, 插入顺序 = FIFO 淘汰顺序
+        # OrderedDict 保证: 同 key 重复 update 不改变顺序; popitem(last=False) FIFO 淘汰
+        self._records: 'OrderedDict[datetime, _Record]' = OrderedDict()
 
         self.snapshots: List[Dict[str, Any]] = []
 
@@ -229,48 +247,116 @@ class PerformanceMonitor:
         timestamp: Optional[datetime] = None,
     ) -> None:
         """
-        追加一条观测 / Append a point.
+        记录一条预测 / Append or update a prediction record.
 
-        ``y_true`` 可为 None (未回填), 调用 ``fill_actual()`` 后补。
+        ``timestamp`` 解释为 ``target_ts`` (预测的目标时点)。
+        若该 ``target_ts`` 已存在, 则**就地更新**字段 (不改变窗口顺序)。
+        若不存在且窗口已满, 按 FIFO 淘汰最早 ``target_ts``。
+
+        典型用法:
+        - 跑批时: ``update(y_pred=p, target_ts=T+1)``
+        - 真值到达: ``fill_actual(target_ts=T+1, y_true=t)`` (推荐)
+          或 ``update(y_pred=p, y_true=t, timestamp=T+1)`` (一并提交)
         """
-        self._y_pred.append(float(y_pred))
-        self._y_true.append(float('nan') if y_true is None else float(y_true))
-        self._y_lower.append(None if y_lower is None else float(y_lower))
-        self._y_upper.append(None if y_upper is None else float(y_upper))
-        self._timestamps.append(timestamp or datetime.now())
+        target_ts = timestamp or datetime.now()
+        existing = self._records.get(target_ts)
+        if existing is not None:
+            # 同 target_ts 再次提交: 就地更新, 不改窗口顺序
+            existing.y_pred = float(y_pred)
+            if y_true is not None:
+                existing.y_true = float(y_true)
+            if y_lower is not None:
+                existing.y_lower = float(y_lower)
+            if y_upper is not None:
+                existing.y_upper = float(y_upper)
+            return
 
-    def fill_actual(self, index: int, y_true: float) -> None:
-        """回填第 index 条 (从窗口起点计数) 的真实值。"""
-        if 0 <= index < len(self._y_true):
-            # deque 不支持 index 写, 转 list 再写回
-            buf = list(self._y_true)
-            buf[index] = float(y_true)
-            self._y_true = deque(buf, maxlen=self.window_size)
+        # 新 target_ts: 满则 FIFO 淘汰
+        if len(self._records) >= self.window_size:
+            self._records.popitem(last=False)
+
+        self._records[target_ts] = _Record(
+            target_ts=target_ts,
+            y_pred=float(y_pred),
+            y_true=None if y_true is None else float(y_true),
+            y_lower=None if y_lower is None else float(y_lower),
+            y_upper=None if y_upper is None else float(y_upper),
+        )
+
+    def fill_actual(
+        self,
+        target_ts: Union[datetime, int],
+        y_true: float,
+    ) -> bool:
+        """
+        按 ``target_ts`` 回填真实值 / Backfill actual by target_ts.
+
+        Returns:
+            True 若找到并填好; False 若该记录已被淘汰出窗口。
+
+        向后兼容: 若传入 ``int``, 视为旧的位置索引接口, 发出
+        ``DeprecationWarning`` 并退化为按插入顺序的第 N 条 (不保证正确)。
+        """
+        if isinstance(target_ts, int):
+            warnings.warn(
+                'fill_actual(index, y_true) 已废弃; 请用 '
+                'fill_actual(target_ts=..., y_true=...). '
+                '位置索引在窗口满时会错位.',
+                DeprecationWarning, stacklevel=2,
+            )
+            keys = list(self._records.keys())
+            if 0 <= target_ts < len(keys):
+                self._records[keys[target_ts]].y_true = float(y_true)
+                return True
+            return False
+
+        rec = self._records.get(target_ts)
+        if rec is None:
+            return False
+        rec.y_true = float(y_true)
+        return True
+
+    def has(self, target_ts: datetime) -> bool:
+        """判断某 target_ts 是否还在窗口内。"""
+        return target_ts in self._records
+
+    def pending_targets(self) -> List[datetime]:
+        """列出已记录但 y_true 还未回填的 target_ts (按时间)。"""
+        return [ts for ts, r in self._records.items() if r.y_true is None]
 
     def current(self) -> Dict[str, float]:
         """
-        计算当前窗口全部已注册指标 / Compute all registered metrics now.
+        计算当前窗口指标 / Compute all metrics from settled records only.
 
-        ``y_true`` 中若有 NaN 会被同位置 pair 一同剔除再算。
+        只用 ``y_true is not None`` 的记录, 顺序按 target_ts 插入序。
         """
-        y_true = np.array(self._y_true, dtype=float)
-        y_pred = np.array(self._y_pred, dtype=float)
-        mask = ~np.isnan(y_true) & ~np.isnan(y_pred)
-        if not mask.any():
+        ys_true: List[float] = []
+        ys_pred: List[float] = []
+        ys_lo: List[Optional[float]] = []
+        ys_hi: List[Optional[float]] = []
+        for r in self._records.values():
+            if r.y_true is None:
+                continue
+            ys_true.append(r.y_true)
+            ys_pred.append(r.y_pred)
+            ys_lo.append(r.y_lower)
+            ys_hi.append(r.y_upper)
+
+        if not ys_true:
             return {name: float('nan') for name in self.metric_names}
 
-        y_true_f = y_true[mask]
-        y_pred_f = y_pred[mask]
+        y_true_f = np.asarray(ys_true, dtype=float)
+        y_pred_f = np.asarray(ys_pred, dtype=float)
 
-        lower_arr, upper_arr = None, None
-        if any(v is not None for v in self._y_lower):
-            lo = np.array([np.nan if v is None else v
-                           for v in self._y_lower], dtype=float)
-            hi = np.array([np.nan if v is None else v
-                           for v in self._y_upper], dtype=float)
-            lo_f = lo[mask]; hi_f = hi[mask]
-            if not (np.isnan(lo_f).all() or np.isnan(hi_f).all()):
-                lower_arr, upper_arr = lo_f, hi_f
+        lower_arr: Optional[np.ndarray] = None
+        upper_arr: Optional[np.ndarray] = None
+        if any(v is not None for v in ys_lo):
+            lo = np.array([np.nan if v is None else v for v in ys_lo],
+                          dtype=float)
+            hi = np.array([np.nan if v is None else v for v in ys_hi],
+                          dtype=float)
+            if not (np.isnan(lo).all() or np.isnan(hi).all()):
+                lower_arr, upper_arr = lo, hi
 
         out: Dict[str, float] = {}
         for name in self.metric_names:
@@ -291,7 +377,9 @@ class PerformanceMonitor:
         row = {
             'timestamp': datetime.now(),
             'metrics': metrics,
-            'n': len(self._y_pred),
+            'n': len(self._records),
+            'n_settled': sum(1 for r in self._records.values()
+                             if r.y_true is not None),
         }
         self.snapshots.append(row)
         return row
@@ -312,18 +400,14 @@ class PerformanceMonitor:
 
     def reset(self) -> None:
         """清空窗口与快照 / Clear window and snapshots."""
-        self._y_true.clear()
-        self._y_pred.clear()
-        self._y_lower.clear()
-        self._y_upper.clear()
-        self._timestamps.clear()
+        self._records.clear()
         self.snapshots.clear()
 
     # ------------------------------------------------------------------
     # 便捷属性
     # ------------------------------------------------------------------
     def __len__(self) -> int:
-        return len(self._y_pred)
+        return len(self._records)
 
     def set_baseline(self, baseline: Mapping[str, float]) -> None:
         self.baseline = dict(baseline)

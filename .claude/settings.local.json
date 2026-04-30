@@ -41,7 +41,14 @@
       "Bash(python -m tsf_frame.monitoring.model_monitor)",
       "Bash(python -m tsf_frame.monitoring.reporters)",
       "Bash(python -m tsf_frame.monitoring.base_monitor)",
-      "Bash(python -c \"import sqlite3; c=sqlite3.connect\\('./logs/hpf_monitor.db'\\); print\\([r for r in c.execute\\(\\\\\"SELECT sql FROM sqlite_master WHERE type='table'\\\\\"\\)]\\)\")"
+      "Bash(python -c \"import sqlite3; c=sqlite3.connect\\('./logs/hpf_monitor.db'\\); print\\([r for r in c.execute\\(\\\\\"SELECT sql FROM sqlite_master WHERE type='table'\\\\\"\\)]\\)\")",
+      "Bash(python -c \"from tsf_frame.monitoring import ModelMonitor; print\\('OK:', ModelMonitor\\)\")",
+      "Bash(python -c \"from tsf_frame.monitoring import ModelMonitor; print\\('package import OK'\\)\")",
+      "Bash(python -c \"import sys; [print\\(f'{i}: {p}'\\) for i, p in enumerate\\(sys.path\\)]\")",
+      "Bash(python -c \"import tsf_frame; print\\('tsf_frame location:', tsf_frame.__file__\\)\")",
+      "Bash(C:/Users/lzxso/anaconda3/envs/tsf_env/python.exe -c \"import tsf_frame; print\\('tsf_frame at:', tsf_frame.__file__\\)\")",
+      "Bash(C:/Users/lzxso/anaconda3/envs/tsf_env/python.exe -m pip install -e .)",
+      "Bash(C:/Users/lzxso/anaconda3/envs/tsf_env/python.exe -m tsf_frame.monitoring.base_monitor)"
     ]
   }
 }

@@ -262,19 +262,53 @@ class MonitoringStatus:
 
     ModelMonitor.check_status() 或 PipelineMonitor.check_status()
     都返回本对象, 便于外部统一处理与序列化。
+    包含模型性能、数据漂移、数据质量、规则告警等全维度监控结果。
     """
 
+    # 唯一标识：被监控的模型ID / Unique identifier for the monitored model
     model_id: str
+
+    # 监控状态生成时间戳（UTC/本地时间）/ Timestamp when this status snapshot was generated
     timestamp: datetime
+
+    # 告警级别：INFO/WARNING/CRITICAL/ERROR 等，由 AlertLevel 枚举定义
+    # Alert severity level (INFO, WARNING, CRITICAL, etc.)
     alert_level: str = AlertLevel.INFO
+
+    # 性能指标字典：如 accuracy, precision, recall, f1, latency 等实时计算的指标值
+    # Dictionary of model performance metrics (key: metric name, value: metric score)
     performance_metrics: Dict[str, float] = field(default_factory=dict)
+
+    # 数据漂移检测结果：特征分布是否发生偏移
+    # Drift detection result for input features (data distribution shift)
     data_drift: Optional[DriftResult] = None
+
+    # 概念漂移检测结果：目标变量/业务概念发生偏移
+    # Drift detection result for concept / target variable distribution
     concept_drift: Optional[DriftResult] = None
+
+    # 预测结果漂移：模型输出分布与历史不一致
+    # Drift detection result for model prediction outputs
     prediction_drift: Optional[DriftResult] = None
+
+    # 数据质量问题列表：缺失值、异常值、格式错误、范围越界等
+    # List of detected data quality issues (missing, outlier, schema, range, etc.)
     quality_issues: List[QualityIssue] = field(default_factory=list)
+
+    # 自定义规则违反列表：业务规则、阈值规则被触发
+    # List of violated custom monitoring rules (thresholds, business logic checks)
     rule_violations: List[RuleViolation] = field(default_factory=list)
+
+    # 是否建议模型重新训练：根据性能/漂移/质量综合判断
+    # Whether the model requires retraining based on monitoring results
     needs_retraining: bool = False
+
+    # 系统自动生成的优化建议：如清洗数据、调整阈值、重新训练等
+    # Automated recommendations for maintenance (clean data, retrain, adjust rules)
     recommendations: List[str] = field(default_factory=list)
+
+    # 扩展字段：用于存储自定义监控数据，便于灵活扩展
+    # Extra custom metadata and monitoring data for extensibility
     extra: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -308,16 +342,22 @@ class StageEvent:
 
 class MetricStore(ABC):
     """
-    持久化抽象层 / Persistence abstraction.
+    模型监控指标存储抽象层 / Persistence abstraction layer for monitoring metrics.
 
-    后端实现: InMemoryStore (测试/默认), SQLiteStore (生产单机),
-    可扩展 FileJsonlStore, PostgresStore, RedisStore 等。
+    定义预测数据、模型指标、告警信息的统一读写接口，屏蔽底层存储实现差异。
+    后端可插拔实现：
+    - InMemoryStore（内存存储，测试/默认）
+    - SQLiteStore（轻量文件数据库，单机生产）
+    - 可扩展：PostgresStore、RedisStore、FileJsonlStore 等
 
-    所有 insert_* 必须幂等可重入, query_* 应支持按 ``model_id``
-    与时间窗过滤。
+    设计规范：
+    1. 所有 insert_* 方法必须保证**幂等、可重入**，重复调用不产生脏数据
+    2. 所有 query_* 方法必须支持按 model_id + 时间窗口 过滤
+    3. 维护方法（cleanup_old/close）为可选实现，提供默认空逻辑
     """
 
-    # --- 写 -------------------------------------------------------------
+    # --- 写入操作：存储预测、真实值、指标、告警 -------------------------------------------------------------
+
     @abstractmethod
     def insert_prediction(
         self,
@@ -330,7 +370,18 @@ class MetricStore(ABC):
         y_upper: Optional[float] = None,
         y_actual: Optional[float] = None,
     ) -> None:
-        """记录一次预测 / Persist one prediction."""
+        """
+        持久化单条模型预测记录
+        用于后续计算性能指标、漂移检测、数据质量监控
+
+        :param model_id: 模型唯一标识
+        :param timestamp: 预测发生时间
+        :param target: 预测目标名称（如价格、销量、故障概率）
+        :param y_pred: 模型预测值
+        :param y_lower: 预测区间下限（可选，适用于区间预测）
+        :param y_upper: 预测区间上限（可选）
+        :param y_actual: 真实值（若实时可得则填写，否则后续通过 update_actual 回填）
+        """
 
     @abstractmethod
     def update_actual(
@@ -341,7 +392,15 @@ class MetricStore(ABC):
         target: str,
         y_actual: float,
     ) -> None:
-        """回填真实值 / Back-fill the actual value."""
+        """
+        异步回填真实值（真实标签延迟到达场景）
+        用于计算准确率、MAE、RMSE 等有监督性能指标
+
+        :param model_id: 模型唯一标识
+        :param timestamp: 对应预测的时间戳（用于关联匹配）
+        :param target: 预测目标名称
+        :param y_actual: 真实观测值/标签
+        """
 
     @abstractmethod
     def insert_metrics_snapshot(
@@ -352,13 +411,27 @@ class MetricStore(ABC):
         metrics: Mapping[str, float],
         window: Optional[int] = None,
     ) -> None:
-        """写一组聚合指标 / Persist a metric snapshot."""
+        """
+        写入一组聚合监控指标快照（性能、漂移、质量等）
+        用于监控面板展示、趋势分析、异常检测
+
+        :param model_id: 模型唯一标识
+        :param timestamp: 指标计算时间
+        :param metrics: 指标字典，如 accuracy、drift_score、missing_rate
+        :param window: 滑动窗口大小，如近100条、近1小时，可为空
+        """
 
     @abstractmethod
     def insert_alert(self, alert: Alert) -> None:
-        """落库一条告警 / Persist an alert."""
+        """
+        持久化单条告警记录
+        告警类型：漂移、性能下降、数据质量异常、规则违反
 
-    # --- 读 -------------------------------------------------------------
+        :param alert: 告警对象，包含级别、类型、内容、时间、模型ID等
+        """
+
+    # --- 读取操作：查询预测、指标、告警 -------------------------------------------------------------
+
     @abstractmethod
     def query_predictions(
         self,
@@ -367,7 +440,14 @@ class MetricStore(ABC):
         start: Optional[datetime] = None,
         end: Optional[datetime] = None,
     ) -> List[Dict[str, Any]]:
-        """查询预测记录 / Query predictions."""
+        """
+        查询指定模型+时间范围内的预测记录
+
+        :param model_id: 模型唯一标识
+        :param start: 开始时间（可选，不填则从最早开始）
+        :param end: 结束时间（可选，不填则到最新为止）
+        :return: 预测记录列表，每条为字典结构
+        """
 
     @abstractmethod
     def query_metrics(
@@ -378,7 +458,16 @@ class MetricStore(ABC):
         end: Optional[datetime] = None,
         name: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """查询指标快照 / Query metric snapshots."""
+        """
+        查询模型监控指标历史
+        可按指标名称过滤，用于趋势图、报表、阈值判断
+
+        :param model_id: 模型唯一标识
+        :param start: 开始时间
+        :param end: 结束时间
+        :param name: 指标名称过滤（如 accuracy、data_drift）
+        :return: 指标历史记录列表
+        """
 
     @abstractmethod
     def query_alerts(
@@ -389,16 +478,34 @@ class MetricStore(ABC):
         end: Optional[datetime] = None,
         min_level: Optional[str] = None,
     ) -> List[Alert]:
-        """查询告警 / Query alerts."""
+        """
+        查询告警历史
+        可按告警级别过滤（如只看 CRITICAL 以上）
 
-    # --- 维护 -----------------------------------------------------------
+        :param model_id: 模型唯一标识
+        :param start: 开始时间
+        :param end: 结束时间
+        :param min_level: 最小告警级别（如 WARNING/CRITICAL）
+        :return: 告警对象列表
+        """
+
+    # --- 存储维护：清理历史数据、关闭连接 -----------------------------------------------------------
+
     def cleanup_old(self, *, retain_days: int) -> int:
-        """删除超过 N 天的记录, 返回删除条数 (子类选填)。"""
+        """
+        删除超过指定天数的历史数据（存储自动清理）
+        防止存储无限膨胀，子类可选实现
+
+        :param retain_days: 保留最近 N 天的数据
+        :return: 删除的记录条数
+        """
         return 0
 
     def close(self) -> None:
-        """关闭连接/释放资源 (子类选填)。"""
-
+        """
+        关闭存储连接、释放资源
+        如数据库连接、文件句柄、客户端连接等，子类可选实现
+        """
 
 class AlertChannel(ABC):
     """

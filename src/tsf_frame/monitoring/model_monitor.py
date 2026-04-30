@@ -8,24 +8,24 @@
 子系统全景::
 
     ModelMonitor(model_id)
-    ├── store               : MetricStore         (default: InMemoryStore)
-    ├── alert_manager       : AlertManager        (default: auto)
-    ├── performance_monitor : PerformanceMonitor  (default: auto)
-    ├── data_quality        : DataQualityMonitor  (可选)
-    ├── data_drift          : DataDriftDetector   (可选, 传 reference 才启用)
-    ├── concept_drift       : ConceptDriftDetector
-    ├── prediction_drift    : PredictionDriftDetector (可选)
-    ├── rule_engine         : RuleEngine          (可选)
-    └── retraining_trigger  : RetrainingTrigger   (default: 默认规则集)
+    ├── store               : MetricStore         (default: InMemoryStore)  把数据存起来
+    ├── alert_manager       : AlertManager        (default: auto)           把告警发出去
+    ├── performance_monitor : PerformanceMonitor  (default: auto)           算MAE/MAPE 等指标
+    ├── data_quality        : DataQualityMonitor  (可选)                     检查原始数据缺失/异常
+    ├── data_drift          : DataDriftDetector   (可选, 传 reference 才启用)  检测特征分布是否变了
+    ├── concept_drift       : ConceptDriftDetector                          检测残差分布是否变了
+    ├── prediction_drift    : PredictionDriftDetector (可选)                 检测预测值分布是否变了
+    ├── rule_engine         : RuleEngine          (可选)                      跑业务规则（如"预测不能为负"）
+    └── retraining_trigger  : RetrainingTrigger   (default: 默认规则集)          判断是否该重训
 
 数据流::
-
+    每来一条预测时
     record_prediction(...)
-        ├─► store.insert_prediction        (持久化)
-        ├─► performance_monitor.update     (指标窗口)
-        ├─► data_drift.update              (特征)
-        ├─► prediction_drift.update        (y_pred)
-        └─► concept_drift.update           (y_true-y_pred 残差, 若有 actual)
+        ├─► store.insert_prediction        (持久化)  (存进数据库)
+        ├─► performance_monitor.update     (指标窗口)   (更新指标)
+        ├─► data_drift.update              (特征)         (喂特征)
+        ├─► prediction_drift.update        (y_pred)     (喂预测值)
+        └─► concept_drift.update           (y_true-y_pred 残差, 若有 actual)    喂残差，如果有真实值)
 
     record_data_batch(df)
         └─► data_quality.check             (原始数据质量)
@@ -43,10 +43,8 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Any, Dict, List, Mapping, Optional
-
 import numpy as np
 import pandas as pd
-
 from .alert_manager import AlertManager
 from .base_monitor import BaseMonitor
 from .data_quality import DataQualityMonitor
@@ -90,6 +88,7 @@ class ModelMonitor(BaseMonitor):
         retraining_trigger:  RetrainingTrigger; 默认使用 default_rules()
         target_name:         目标列名 (记入 store 与告警 detail)
         cold_start_samples:  积累 < 此数量前跳过漂移检测 (防小样本误报)
+        window_size：        指标的"近期窗口"
     """
 
     def __init__(
@@ -106,9 +105,9 @@ class ModelMonitor(BaseMonitor):
         rule_engine: Optional[RuleEngine] = None,
         retraining_trigger: Optional[RetrainingTrigger] = None,
         target_name: str = 'y',
-        cold_start_samples: int = 20,
-        window_size: int = 100,
-        history_size: int = 20000,
+        cold_start_samples: int = 20,   # 冷启动样本数
+        window_size: int = 100,             # 业务计算窗口
+        history_size: int = 20000,           # 事件留底缓冲
     ):
         super().__init__(model_id, history_size=history_size)
 
@@ -132,10 +131,10 @@ class ModelMonitor(BaseMonitor):
         self.target_name = target_name
         self.cold_start_samples = int(cold_start_samples)
 
-        self._n_records: int = 0
-        self._last_actual: Optional[float] = None
-        self._samples_since_last_train: int = 0
-        self._last_train_at: Optional[datetime] = self.created_at
+        self._n_records: int = 0     # 累计收到了多少条预测。
+        self._last_actual: Optional[float] = None  #最近一次真实值（如果有的话）。
+        self._samples_since_last_train: int = 0     #离上次训练以来收到了多少条预测
+        self._last_train_at: Optional[datetime] = self.created_at   #模型上次被训练的时间
 
     # ------------------------------------------------------------------
     # BaseMonitor 必须实现的抽象
@@ -199,8 +198,39 @@ class ModelMonitor(BaseMonitor):
         features: Optional[Any] = None,
         y_lower: Optional[float] = None,
         y_upper: Optional[float] = None,
+        update_drift: bool = True,
     ) -> None:
-        """记录一次模型预测 (核心入口)。"""
+        """
+        记录一次模型预测 / Record one prediction.
+
+        ``timestamp`` 解释为 **target_ts** (预测的目标时点),
+        以保证后续 ``settle_actual(target_ts=...)`` 能精确回填。
+
+        多步 horizon 跑批用法 (推荐):
+            # 一次跑批输出 12 个 horizon, 但 features 只喂一次到 drift_detector
+            for h in range(1, 13):
+                target_ts = forecast_time + relativedelta(months=h)
+                mon.record_prediction(
+                    timestamp=target_ts,
+                    prediction=preds[h-1],
+                    features=feat_at_forecast if h == 1 else None,
+                    update_drift=(h == 1),       # 只在 h=1 喂 prediction_drift
+                )
+
+        异步真值到达时, **不要再次调用 record_prediction**, 改用
+        ``settle_actual(target_ts=..., y_actual=...)`` 回填。
+
+        Args:
+            timestamp:    预测目标时点 (target_ts), 作为对齐键
+            prediction:   预测点估计
+            actual:       同步可知的真值 (一般为 None, HPF 等异步场景)
+            features:     特征向量 (1D) 或矩阵 (2D), 仅在 update_drift 时
+                          推入 data_drift; HPF 跑批每月只应推一次
+            y_lower/y_upper: 概率预测区间
+            update_drift: 是否把本条推入 prediction_drift / data_drift;
+                          多步 horizon 跑批时建议**只在 h=1 设 True**, 避免
+                          同一组特征 / 同一次跑批被 12 倍放大
+        """
         self._n_records += 1
         self._samples_since_last_train += 1
         prediction = float(prediction)
@@ -217,22 +247,22 @@ class ModelMonitor(BaseMonitor):
         except Exception:  # pragma: no cover
             pass
 
-        # 2) 性能窗口
+        # 2) 性能窗口 (按 target_ts 对齐)
         self.perf.update(
             y_pred=prediction, y_true=actual_f,
             y_lower=y_lower, y_upper=y_upper, timestamp=timestamp,
         )
 
-        # 3) 特征漂移
-        if self.data_drift is not None and features is not None:
+        # 3) 特征漂移 (仅在 update_drift 时推入, 防 horizon 放大)
+        if update_drift and self.data_drift is not None and features is not None:
             arr = np.atleast_2d(np.asarray(features, dtype=float))
             self.data_drift.update(arr)
 
-        # 4) 预测漂移
-        if self.prediction_drift is not None:
+        # 4) 预测漂移 (同上)
+        if update_drift and self.prediction_drift is not None:
             self.prediction_drift.update(np.array([prediction]))
 
-        # 5) 概念漂移 (需要 actual)
+        # 5) 概念漂移 (需要 actual; HPF 异步场景下一般在 settle_actual 中触发)
         if actual_f is not None:
             resid = actual_f - prediction
             self.concept_drift.update(np.array([resid]))
@@ -243,6 +273,65 @@ class ModelMonitor(BaseMonitor):
             'y_pred': prediction, 'y_actual': actual_f,
             'y_lower': y_lower, 'y_upper': y_upper,
         })
+
+    def settle_actual(
+        self,
+        *,
+        target_ts: datetime,
+        y_actual: float,
+    ) -> bool:
+        """
+        异步真值到达时回填 / Settle the actual value for a target_ts.
+
+        触发链:
+        1. ``perf.fill_actual(target_ts, y_actual)`` — 按 target_ts 对齐回填
+        2. ``store.update_actual(...)`` — 持久化真值
+        3. 若回填成功且能取到对应 y_pred → 算残差喂 ``concept_drift``
+        4. 更新 ``_last_actual`` (供 R2_SUDDEN_CHANGE 等规则用)
+
+        Returns:
+            True 若 perf 窗口里找到该 target_ts 并回填; False 已被淘汰。
+            (即便返回 False, store 仍会尝试 update_actual, 因 SQLite 历史可能保留更长。)
+
+        典型用法:
+            # 4 月底 3 月真值出来了
+            mon.settle_actual(target_ts=pd.Timestamp('2026-03-01'),
+                              y_actual=178.5)
+        """
+        y_actual_f = float(y_actual)
+
+        # 1) 取本窗口里的 y_pred, 算残差用
+        rec = self.perf._records.get(target_ts)  # type: ignore[attr-defined]
+        y_pred_for_residual: Optional[float] = (
+            rec.y_pred if rec is not None else None
+        )
+
+        # 2) 回填 perf 窗口
+        filled = self.perf.fill_actual(target_ts=target_ts, y_true=y_actual_f)
+
+        # 3) 持久化回填 (store 历史可能更长, 即使 perf 已淘汰也尝试更新)
+        try:
+            self.store.update_actual(
+                model_id=self.model_id, timestamp=target_ts,
+                target=self.target_name, y_actual=y_actual_f,
+            )
+        except Exception:  # pragma: no cover
+            pass
+
+        # 4) 残差喂 concept_drift
+        if y_pred_for_residual is not None:
+            resid = y_actual_f - y_pred_for_residual
+            self.concept_drift.update(np.array([resid]))
+            self._last_actual = y_actual_f
+
+        # 5) history 留底 (便于审计)
+        self.history.append({
+            'timestamp': target_ts,
+            'event': 'settle_actual',
+            'y_actual': y_actual_f,
+            'filled_in_perf': filled,
+        })
+        return filled
 
     # ------------------------------------------------------------------
     # 状态聚合
@@ -276,10 +365,15 @@ class ModelMonitor(BaseMonitor):
                 prediction_drift = self.prediction_drift.detect()
 
         # 3) rules
+        # 多步 horizon 场景下, perf 窗口里最新的 target_ts 即"下一步预测",
+        # 等价于 h=1 视角 — 这是规则检查 (尤其 R2_SUDDEN_CHANGE) 应该看的。
+        # history[-1] 不可靠 (可能是 settle_actual 事件或 h=12 的预测)。
         rule_violations: List[RuleViolation] = []
         if self.rule_engine is not None:
-            last_pred = (self.history[-1]['y_pred']
-                         if self.history else None)
+            last_pred: Optional[float] = None
+            if self.perf._records:  # type: ignore[attr-defined]
+                last_target_ts = next(reversed(self.perf._records))  # type: ignore[attr-defined]
+                last_pred = self.perf._records[last_target_ts].y_pred  # type: ignore[attr-defined]
             if last_pred is not None:
                 rule_violations = self.rule_engine.check(
                     prediction=[last_pred],
