@@ -112,34 +112,67 @@ class ModelMonitor(BaseMonitor):
     ):
         super().__init__(model_id, history_size=history_size)
 
+        # ── 子系统 (依赖注入, 全部可替换) ────────────────────────────
+        # 持久化后端 (Memory / SQLite / JSONL); 默认内存
+        # / Pluggable persistence backend
         self.store: MetricStore = store or InMemoryStore()
+        # 告警分发中心; 默认自建并绑定 store
+        # / Alert manager (auto-built & bound to store if not provided)
         self.alert_manager: AlertManager = (
             alert_manager or AlertManager(model_id, store=self.store)
         )
+        # 性能滑窗监控 (target_ts 对齐, metric_window 默认 12)
+        # / Sliding-window performance monitor
         self.perf: PerformanceMonitor = performance_monitor or \
             PerformanceMonitor(
                 model_id,
                 window_size=window_size,
                 metric_window=metric_window,
             )
+        # 原始数据质量检查器, None 表示不做该检查
+        # / Optional raw-data quality monitor
         self.data_quality = data_quality
+        # 数据漂移检测器 (PSI/KS on 特征), None 不检测
+        # / Optional data (covariate) drift detector
         self.data_drift = data_drift
+        # 概念漂移检测器 (残差分布), 默认自建; 必有
+        # / Concept drift detector (residual-based); always created
         self.concept_drift: ConceptDriftDetector = (
             concept_drift or ConceptDriftDetector(window_size=window_size)
         )
+        # 预测分布漂移检测器, None 不检测
+        # / Optional prediction-output drift detector
         self.prediction_drift = prediction_drift
+        # 业务规则引擎 (R1_NON_NEGATIVE 等), None 不跑规则
+        # / Optional declarative rule engine
         self.rule_engine = rule_engine
+        # 重训触发器, 默认带 5 条通用规则
+        # / Retraining trigger; default rules are reasonable for general use
         self.retraining_trigger: RetrainingTrigger = (
             retraining_trigger or RetrainingTrigger()
         )
 
+        # ── 业务上下文 ──────────────────────────────────────────────
+        # 目标列名 (落库 + 告警 detail 用), e.g. 'monthly_deposit'
+        # / Target column name for storage / alert details
         self.target_name = target_name
+        # 冷启动期样本阈值: 累计 < 此数量时跳过漂移检测, 防小样本误报
+        # / Skip drift detection until this many samples accumulated
         self.cold_start_samples = int(cold_start_samples)
 
-        self._n_records: int = 0     # 累计收到了多少条预测。
-        self._last_actual: Optional[float] = None  #最近一次真实值（如果有的话）。
-        self._samples_since_last_train: int = 0     #离上次训练以来收到了多少条预测
-        self._last_train_at: Optional[datetime] = self.created_at   #模型上次被训练的时间
+        # ── 内部累积计数器 ───────────────────────────────────────────
+        # 累计收到的预测条数 (用于冷启动判断)
+        # / Total predictions ever recorded
+        self._n_records: int = 0
+        # 最近一次回填到的真值, 供 R2_SUDDEN_CHANGE 等规则使用
+        # / Last settled actual (used by sudden-change rule)
+        self._last_actual: Optional[float] = None
+        # 自上次重训以来累计收到的预测条数, 触发量驱动重训
+        # / Predictions since last retrain (volume-based retrain rule)
+        self._samples_since_last_train: int = 0
+        # 上次重训发生时刻; 默认初始化为创建时刻 (有"时长"概念)
+        # / Last retraining timestamp (drives time-based retrain rule)
+        self._last_train_at: Optional[datetime] = self.created_at
 
     # ------------------------------------------------------------------
     # BaseMonitor 必须实现的抽象

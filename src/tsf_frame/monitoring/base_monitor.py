@@ -49,8 +49,15 @@ class BaseMonitor(ABC):
     def __init__(self, model_id: str, history_size: int = 10000):
         if not model_id:
             raise ValueError('model_id must be non-empty')
+        # 监控对象的唯一标识 (模型 ID 或管道 ID), 落库 / 告警都靠它分组
+        # / Unique identifier for the monitored entity
         self.model_id: str = model_id
+        # 监控器实例创建时刻, 用于"距上次重训多久"等时间相关判断
+        # / Instance creation timestamp
         self.created_at: datetime = datetime.now()
+        # 最近 N 条 record() 事件的回放缓冲, deque 满后自动 FIFO 淘汰
+        # 不存全量 (避免内存膨胀); 用作调试 / 审计 / recent() 查询
+        # / Bounded event ring buffer (FIFO) for recent inspection
         self.history: Deque[Dict[str, Any]] = deque(maxlen=history_size)
 
     # ------------------------------------------------------------------

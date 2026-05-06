@@ -80,9 +80,17 @@ class InMemoryStore(MetricStore):
     """
 
     def __init__(self) -> None:
+        # 预测记录列表 (一条 = insert_prediction 一次)
+        # / In-memory predictions table
         self._predictions: List[Dict[str, Any]] = []
+        # 指标快照列表 (扁平化为 {model_id, ts, name, value, window})
+        # / Flattened metrics snapshot rows
         self._metrics: List[Dict[str, Any]] = []
+        # 告警对象列表
+        # / Alert records
         self._alerts: List[Alert] = []
+        # 互斥锁, 保护多线程并发写
+        # / Mutex for thread-safe writes
         self._lock = threading.Lock()
 
     # ---- writes ----
@@ -249,8 +257,11 @@ class SQLiteStore(MetricStore):
     """
 
     def __init__(self, db_path: str = './logs/monitor.db') -> None:
+        # SQLite 数据库文件绝对路径, 父目录会自动创建
+        # / Absolute path to SQLite db file
         self.db_path = os.path.abspath(db_path)
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+        # 启动时建表 + 索引 (CREATE IF NOT EXISTS, 幂等)
         self._init_schema()
 
     # ---- low-level helpers ---------------------------------------------
@@ -451,11 +462,21 @@ class JsonlStore(MetricStore):
     """
 
     def __init__(self, base_dir: str = './logs/jsonl') -> None:
+        # JSONL 文件根目录 (每类一个文件: predictions / metrics / alerts)
+        # / Root directory containing the three jsonl files
         self.base_dir = Path(base_dir)
         self.base_dir.mkdir(parents=True, exist_ok=True)
+        # 预测追加日志, 每行一个 JSON 对象
+        # / Append-only predictions log
         self._pred_file = self.base_dir / 'predictions.jsonl'
+        # 指标快照追加日志
+        # / Append-only metrics snapshot log
         self._metric_file = self.base_dir / 'metrics.jsonl'
+        # 告警追加日志
+        # / Append-only alerts log
         self._alert_file = self.base_dir / 'alerts.jsonl'
+        # 写入锁, 保证多线程下行不交错
+        # / Mutex for thread-safe append
         self._lock = threading.Lock()
 
     def _append(self, path: Path, obj: Dict[str, Any]) -> None:

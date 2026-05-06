@@ -69,7 +69,11 @@ class MissingRateCheck(QualityChecker):
         self, threshold: float = 0.1,
         columns: Optional[Sequence[str]] = None,
     ) -> None:
+        # 缺失率告警阈值 (0~1); >此值 WARNING, >2x 此值 ERROR
+        # / Missing-rate threshold; >threshold=WARN, >2x=ERR
         self.threshold = float(threshold)
+        # 限定要检查的列; None = 检查所有列
+        # / Restrict check to these columns; None = all columns
         self.columns = list(columns) if columns else None
 
     def check(self, data: pd.DataFrame) -> List[QualityIssue]:
@@ -118,9 +122,17 @@ class OutlierCheck(QualityChecker):
     ) -> None:
         if method not in ('zscore', 'iqr'):
             raise ValueError(f"method must be 'zscore'|'iqr', got {method!r}")
+        # 异常值检测方法: 'zscore' (|z|>k) 或 'iqr' (Q1-1.5*IQR ~ Q3+1.5*IQR 外)
+        # / Outlier detection method
         self.method = method
+        # zscore 模式下的 |z| 阈值
+        # / Z-score absolute threshold (zscore method only)
         self.z_threshold = float(z_threshold)
+        # 列异常值占比阈值; 超过即 WARNING
+        # / Outlier ratio above which WARNING fires
         self.ratio_threshold = float(ratio_threshold)
+        # 限定要检查的数值列; None = 检查所有数值列
+        # / Restrict check to these columns; None = all numeric
         self.columns = list(columns) if columns else None
 
     def _outlier_mask(self, x: np.ndarray) -> np.ndarray:
@@ -181,7 +193,11 @@ class SchemaCheck(QualityChecker):
         self, required: Sequence[str],
         dtypes: Optional[Mapping[str, str]] = None,
     ):
+        # 必须存在的列名; 缺失任一就 CRITICAL
+        # / Required column names; any missing → CRITICAL
         self.required = list(required)
+        # 期望 dtype 映射 {col: 'int'/'float'/'datetime64'/...}; 不匹配 WARNING
+        # / Expected dtype prefixes; mismatch → WARNING
         self.dtypes = dict(dtypes or {})
 
     def check(self, data: pd.DataFrame) -> List[QualityIssue]:
@@ -229,7 +245,11 @@ class FrequencyCheck(QualityChecker):
     """
 
     def __init__(self, expected_freq: str, tolerance: int = 0):
+        # pandas offset 字符串, e.g. 'D'(日), 'MS'(月初), 'H'(小时)
+        # / pandas frequency string for expected index
         self.expected_freq = expected_freq
+        # 容许的缺失期数; 超过即 ERROR
+        # / Number of missing periods tolerated before reporting ERROR
         self.tolerance = int(tolerance)
 
     def check(self, data: pd.DataFrame) -> List[QualityIssue]:
@@ -292,10 +312,16 @@ class RangeCheck(QualityChecker):
         non_negative: Optional[Sequence[str]] = None,
         monotonic_increasing: Optional[Sequence[str]] = None,
     ):
+        # 列值域约束 {col: (min, max)}; None 边界表示该方向不约束
+        # / Per-column (min, max) constraints; None means unbounded on that side
         self.constraints: Dict[str, tuple] = dict(constraints or {})
+        # non_negative 简写: 把指定列的下界设为 0 (与 constraints 合并)
+        # / Sugar for non-negative columns
         for col in (non_negative or []):
             prev = self.constraints.get(col, (None, None))
             self.constraints[col] = (0, prev[1])
+        # 必须单调不减的列名列表 (累计余额这种业务约束)
+        # / Columns that must be monotonically non-decreasing
         self.mono_inc = list(monotonic_increasing or [])
 
     def check(self, data: pd.DataFrame) -> List[QualityIssue]:
@@ -360,6 +386,8 @@ class DataQualityMonitor:
                       是否阻断管道
     """
 
+    # 串行执行的检查器列表; 顺序即扫描顺序 (任一抛异常会被捕获并产生 CHECKER_ERROR issue)
+    # / Ordered list of checkers to run; one failing checker doesn't abort others
     checkers: List[QualityChecker] = field(default_factory=list)
 
     def add(self, checker: QualityChecker) -> 'DataQualityMonitor':

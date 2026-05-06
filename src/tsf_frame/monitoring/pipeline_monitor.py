@@ -79,10 +79,18 @@ class PipelineMonitor(BaseMonitor):
         history_size: int = 5000,
     ):
         super().__init__(pipeline_id, history_size=history_size)
+        # 持久化后端 (stage 耗时和成功率会被写为 metrics_snapshot)
+        # / Optional MetricStore for stage metrics
         self.store = store
+        # 告警分发中心: 阶段失败 → ERROR, 超时 → WARNING
+        # / Alert manager for stage failures / slowdowns
         self.alert_manager = alert_manager or AlertManager(
             pipeline_id, store=store)
+        # 阶段耗时阈值 (毫秒), 超过即触发 WARNING 告警
+        # / Per-stage duration threshold (ms) above which WARNING fires
         self.slow_threshold_ms = float(slow_threshold_ms)
+        # 全部阶段事件的有序列表 (每次 stage() 上下文管理器结束都追加一条)
+        # / Append-only log of all stage events ever recorded
         self.events: List[StageEvent] = []
 
     # ------------------------------------------------------------------

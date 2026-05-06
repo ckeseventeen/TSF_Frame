@@ -42,6 +42,8 @@ from .interfaces import (
 
 __all__ = [
     'PerformanceMonitor',
+    'MultiHorizonMonitor',
+    'MultiTargetMonitor',
     'mae',
     'mse',
     'rmse',
@@ -178,11 +180,21 @@ def winkler(y_true, y_pred=None, y_lower=None, y_upper=None,
 
 @dataclass
 class _Record:
-    """单条预测记录 / Single prediction record keyed by target_ts."""
+    """
+    单条预测记录 / Single prediction record keyed by target_ts.
+
+    一条记录表示"对某个目标时点 (target_ts) 的一次预测", 真值通过
+    ``fill_actual`` 异步回填。
+    """
+    # 预测的目标时点 (作为对齐键, 不依赖位置索引)
     target_ts: datetime
+    # 模型预测点估计 (必填)
     y_pred: float
+    # 真值, 异步回填; None 表示尚未到达 / awaiting fill
     y_true: Optional[float] = None
+    # 概率预测下界, None 表示该模型不输出区间
     y_lower: Optional[float] = None
+    # 概率预测上界, None 表示该模型不输出区间
     y_upper: Optional[float] = None
 
 
@@ -228,10 +240,13 @@ class PerformanceMonitor:
         baseline: Optional[Mapping[str, float]] = None,
         probabilistic: bool = False,
     ):
+        # 模型唯一标识, 落库时区分多个模型 / Model identifier for store partitioning
         self.model_id = model_id
+        # 队列存储容量上限 (FIFO 淘汰最早的 target_ts)
+        # / Storage capacity (FIFO eviction)
         self.window_size = int(window_size)
 
-        # 校验 metric_window
+        # 校验 metric_window: 必须为正, 不超过 window_size
         mw = int(metric_window)
         if mw <= 0:
             raise ValueError(
@@ -245,20 +260,31 @@ class PerformanceMonitor:
                 RuntimeWarning, stacklevel=2,
             )
             mw = self.window_size
+        # 计算指标时只取最近 N 条已 settle 的记录; 默认 12 (HPF 月度场景)
+        # / Sliding metric window (only the last N settled records contribute)
         self.metric_window: int = mw
 
+        # 基线指标字典 {metric_name: baseline_value}, 用于 compare_to_baseline
+        # / Baseline metric values for relative comparison
         self.baseline: Dict[str, float] = dict(baseline or {})
+        # 是否启用概率预测指标 (PICP/MIW/Winkler)
+        # / Whether to compute probabilistic interval metrics
         self.probabilistic = probabilistic
+        # 实际计算的指标名列表; probabilistic=True 时会自动追加 prob 指标
+        # / Active metric names; auto-augmented when probabilistic
         self.metric_names: List[str] = list(metrics or self.DEFAULT_METRICS)
         if probabilistic:
             for m in self.PROB_METRICS:
                 if m not in self.metric_names:
                     self.metric_names.append(m)
 
-        # target_ts -> _Record, 插入顺序 = FIFO 淘汰顺序
-        # OrderedDict 保证: 同 key 重复 update 不改变顺序; popitem(last=False) FIFO 淘汰
+        # 主存储: target_ts → _Record, 插入顺序即 FIFO 淘汰顺序
+        # OrderedDict 保证: 同 key 重复 update 不改变位置; popitem(last=False) 淘汰最早
+        # / Primary store; OrderedDict guarantees insertion-ordered FIFO eviction
         self._records: 'OrderedDict[datetime, _Record]' = OrderedDict()
 
+        # 每次 snapshot() 调用追加一行的指标历史, 便于趋势分析
+        # / History of snapshots produced by snapshot()
         self.snapshots: List[Dict[str, Any]] = []
 
     # ------------------------------------------------------------------
@@ -471,6 +497,549 @@ class PerformanceMonitor:
 
     def set_baseline(self, baseline: Mapping[str, float]) -> None:
         self.baseline = dict(baseline)
+
+
+# ==========================================================================
+# MultiHorizonMonitor — 单模型多输出监控
+# ==========================================================================
+
+class MultiHorizonMonitor:
+    """
+    多步 horizon 性能监控 / Per-horizon performance tracking.
+
+    适用: **单个模型一次性输出 H 步预测**(典型场景: HPF 月度跑批
+    输出未来 12 个月)。内部为每个 horizon 维护一个独立的
+    ``PerformanceMonitor``, 实现:
+
+    * 每个 horizon 独立的 MAPE/MAE/RMSE/R² 等指标
+    * 同一 ``target_ts`` 的真值能**自动回填所有 horizon**
+    * 短期(h=1)/长期(h=H) 表现可独立观察, 暴露"长期模型已坏"等问题
+    * 跨 horizon **加权聚合** (默认按各 horizon settled 样本数加权)
+
+    Args:
+        model_id:       模型标识 (内部各 PerformanceMonitor 标识为 ``{model_id}_h{h}``)
+        horizons:       要追踪的步数列表, 默认 ``[1..12]`` (HPF 月度场景)
+        window_size:    每个内部 PerformanceMonitor 的存储队列容量
+        metric_window:  每个内部 PerformanceMonitor 的指标计算窗口
+        metrics:        指标名列表, None 用 PerformanceMonitor 默认
+        baseline:       基线指标字典, 共享给每个 horizon
+        probabilistic:  是否启用 PICP/MIW/Winkler
+
+    用法::
+
+        from tsf_frame.monitoring import MultiHorizonMonitor
+
+        mhm = MultiHorizonMonitor(
+            model_id='hpf_deposit',
+            horizons=range(1, 13),
+            window_size=36, metric_window=12,
+        )
+
+        # 1) 跑批: 一次记 12 个 horizon
+        from dateutil.relativedelta import relativedelta
+        forecast_time = pd.Timestamp('2026-04-01')
+        target_times = [forecast_time + relativedelta(months=h)
+                        for h in range(1, 13)]
+        mhm.record_forecast(
+            forecast_time=forecast_time,
+            predictions=preds,                # shape (12,)
+            target_times=target_times,
+        )
+
+        # 2) 真值到达: 一次回填所有 horizon
+        mhm.settle_actual(
+            target_ts=pd.Timestamp('2026-05-01'),
+            y_actual=178_500_000.0,
+        )
+
+        # 3) 查询: 看每个 horizon 表现
+        for h, m in mhm.current().items():
+            print(f'h={h:2d}  MAPE={m["mape"]:.2%}')
+        # h= 1  MAPE=2.10%
+        # h= 6  MAPE=8.30%
+        # h=12  MAPE=15.20%   ← 长期已坏
+
+        # 4) 跨 horizon 聚合 (默认按 settled 样本数加权)
+        agg = mhm.aggregated()
+    """
+
+    def __init__(
+        self,
+        model_id: str,
+        *,
+        horizons: 'Any' = tuple(range(1, 13)),
+        window_size: int = 100,
+        metric_window: int = 12,
+        metrics: Optional[List[str]] = None,
+        baseline: Optional[Mapping[str, float]] = None,
+        probabilistic: bool = False,
+    ):
+        # 顶层模型标识, 内部各 PerformanceMonitor 名为 {model_id}_h{h}
+        # / Parent model identifier
+        self.model_id = model_id
+        # 要追踪的步数列表 (升序去重), 例如 [1, 3, 6, 12]
+        # / Sorted unique horizon list
+        self.horizons: List[int] = sorted(set(int(h) for h in horizons))
+        if not self.horizons:
+            raise ValueError('horizons 不能为空')
+        if any(h <= 0 for h in self.horizons):
+            raise ValueError(f'horizons 必须 > 0, got {self.horizons}')
+
+        # 主存储: horizon → 独立的 PerformanceMonitor, 每个 horizon 各算各的指标
+        # / Per-horizon performance monitor map; one independent PM per horizon
+        self.per_horizon: Dict[int, PerformanceMonitor] = {
+            h: PerformanceMonitor(
+                f'{model_id}_h{h}',
+                window_size=window_size,
+                metric_window=metric_window,
+                metrics=metrics,
+                baseline=baseline,
+                probabilistic=probabilistic,
+            )
+            for h in self.horizons
+        }
+
+    # ------------------------------------------------------------------
+    # 写入
+    # ------------------------------------------------------------------
+    def record_forecast(
+        self,
+        *,
+        forecast_time: datetime,
+        predictions: 'Any',
+        target_times: Optional['Any'] = None,
+        y_lower: Optional['Any'] = None,
+        y_upper: Optional['Any'] = None,
+    ) -> None:
+        """
+        记录一次完整多步预测 / Record one batch of horizon forecasts.
+
+        Args:
+            forecast_time: 预测产生时点 (跑批日)
+            predictions:   长度 = ``len(self.horizons)`` 的预测序列
+            target_times:  各 horizon 对应的 target_ts; None 时按月递推
+                           (要求 horizons 的步距以"月"解释)
+            y_lower:       各 horizon 的预测下界 (可选, 概率预测时使用)
+            y_upper:       各 horizon 的预测上界 (同上)
+
+        Raises:
+            ValueError: 长度不匹配
+        """
+        preds = list(predictions)
+        if len(preds) != len(self.horizons):
+            raise ValueError(
+                f'predictions 长度 {len(preds)} ≠ horizons '
+                f'数量 {len(self.horizons)}'
+            )
+
+        if target_times is None:
+            try:
+                from dateutil.relativedelta import relativedelta
+            except Exception as exc:  # pragma: no cover
+                raise RuntimeError(
+                    '默认 target_times 推导需要 dateutil; '
+                    '请显式传入 target_times 或安装 python-dateutil'
+                ) from exc
+            target_times_list = [forecast_time + relativedelta(months=h)
+                                 for h in self.horizons]
+        else:
+            target_times_list = list(target_times)
+            if len(target_times_list) != len(self.horizons):
+                raise ValueError(
+                    f'target_times 长度 {len(target_times_list)} ≠ '
+                    f'horizons 数量 {len(self.horizons)}'
+                )
+
+        lo_list = list(y_lower) if y_lower is not None else None
+        hi_list = list(y_upper) if y_upper is not None else None
+
+        for i, h in enumerate(self.horizons):
+            self.per_horizon[h].update(
+                y_pred=float(preds[i]),
+                timestamp=target_times_list[i],
+                y_lower=None if lo_list is None else float(lo_list[i]),
+                y_upper=None if hi_list is None else float(hi_list[i]),
+            )
+
+    def settle_actual(
+        self,
+        *,
+        target_ts: datetime,
+        y_actual: float,
+    ) -> Dict[int, bool]:
+        """
+        某个 ``target_ts`` 的真值到达 → **同时**回填所有 horizon.
+
+        Returns:
+            {horizon: filled_or_not} — 每个 horizon 是否找到该 target_ts 并回填
+            (False 表示该 horizon 的窗口里已淘汰该记录)
+        """
+        out: Dict[int, bool] = {}
+        for h, pm in self.per_horizon.items():
+            out[h] = pm.fill_actual(target_ts=target_ts, y_true=float(y_actual))
+        return out
+
+    # ------------------------------------------------------------------
+    # 查询
+    # ------------------------------------------------------------------
+    def current(
+        self, window: Optional[int] = None,
+    ) -> Dict[int, Dict[str, float]]:
+        """各 horizon 的当前指标 / Per-horizon metrics dict."""
+        return {h: pm.current(window=window)
+                for h, pm in self.per_horizon.items()}
+
+    def aggregated(
+        self,
+        window: Optional[int] = None,
+        weights: Optional[Mapping[int, float]] = None,
+    ) -> Dict[str, float]:
+        """
+        跨 horizon 聚合指标 / Aggregated metrics across horizons.
+
+        Args:
+            window:  per-horizon ``current()`` 的 window 覆盖
+            weights: ``{horizon: weight}`` 加权;
+                     None 时按各 horizon **已 settled 的样本数**加权
+
+        Returns:
+            {metric_name: weighted_value}
+        """
+        per_h = self.current(window=window)
+        if not per_h:
+            return {}
+
+        # 默认权重: 各 horizon settled 数量
+        if weights is None:
+            counts = {
+                h: sum(1 for r in pm._records.values()
+                       if r.y_true is not None)
+                for h, pm in self.per_horizon.items()
+            }
+            total = sum(counts.values())
+            if total > 0:
+                weights = {h: c / total for h, c in counts.items()}
+            else:
+                # 全空, 平均
+                weights = {h: 1.0 / len(per_h) for h in per_h}
+
+        # 收集所有出现过的指标名
+        all_names: List[str] = []
+        for m in per_h.values():
+            for n in m:
+                if n not in all_names and not n.endswith('__error'):
+                    all_names.append(n)
+
+        out: Dict[str, float] = {}
+        for name in all_names:
+            num, den = 0.0, 0.0
+            for h, m in per_h.items():
+                v = m.get(name)
+                w = float(weights.get(h, 0.0))
+                if (v is not None
+                        and not (isinstance(v, float) and np.isnan(v))
+                        and w > 0):
+                    num += v * w
+                    den += w
+            out[name] = num / den if den > 0 else float('nan')
+        return out
+
+    def snapshot(self, window: Optional[int] = None) -> Dict[str, Any]:
+        """组合 per-horizon + 聚合的快照, 便于写 store / 报表。"""
+        per_h = self.current(window=window)
+        agg = self.aggregated(window=window)
+        used_window = (int(window) if window is not None
+                       else next(iter(self.per_horizon.values())).metric_window)
+        return {
+            'timestamp': datetime.now(),
+            'model_id': self.model_id,
+            'horizons': self.horizons,
+            'metric_window': used_window,
+            'per_horizon': per_h,
+            'aggregated': agg,
+            'n_settled_per_horizon': {
+                h: sum(1 for r in pm._records.values()
+                       if r.y_true is not None)
+                for h, pm in self.per_horizon.items()
+            },
+        }
+
+    def pending_targets(self) -> Dict[int, List[datetime]]:
+        """各 horizon 中还未 settle 的 target_ts."""
+        return {h: pm.pending_targets()
+                for h, pm in self.per_horizon.items()}
+
+    def reset(self) -> None:
+        for pm in self.per_horizon.values():
+            pm.reset()
+
+    def __len__(self) -> int:
+        return sum(len(pm) for pm in self.per_horizon.values())
+
+
+# ==========================================================================
+# MultiTargetMonitor — 单模型多目标监控
+# ==========================================================================
+
+class MultiTargetMonitor:
+    """
+    多目标性能监控 / Per-target performance tracking.
+
+    适用: **单个模型同时预测多个不同的物理量**(典型场景: 一次性输出
+    温度 + 湿度 + 气压, 或 HPF 同时预测 deposit + withdrawal + loan_balance)。
+
+    与 ``MultiHorizonMonitor`` 的区别:
+    * 后者按"时间步"拆分 (同物理量, 不同 horizon)
+    * 本类按"物理量"拆分 (不同物理量, 同时间步)
+
+    每个目标维护独立的 ``PerformanceMonitor``, 便于:
+    * 各目标独立的 baseline / 阈值 (温度 MAPE 5% 警戒, 湿度 10% 才警戒)
+    * 各目标独立的概率区间开关 (温度有区间, 湿度无)
+    * 真值部分到达 (温度先到, 湿度迟到)
+    * 各目标独立的 metric 集合
+
+    Args:
+        model_id:               模型标识 (内部各 PerformanceMonitor 标识为 ``{model_id}_{target}``)
+        targets:                目标名列表, e.g. ``['temperature', 'humidity']``
+        window_size:            每个目标的存储队列容量
+        metric_window:          每个目标的指标计算窗口
+        metrics:                指标名列表 (所有目标共用); None 用 PerformanceMonitor 默认
+        baseline_per_target:    ``{target: {metric: baseline_value}}``, 各目标独立基线
+        probabilistic_targets:  启用 PICP/MIW/Winkler 的目标列表
+
+    用法::
+
+        from tsf_frame.monitoring import MultiTargetMonitor
+
+        mtm = MultiTargetMonitor(
+            model_id='weather',
+            targets=['temperature', 'humidity', 'pressure'],
+            window_size=200, metric_window=24,
+            baseline_per_target={
+                'temperature': {'mape': 0.03},   # 温度基线 3%
+                'humidity':    {'mape': 0.08},   # 湿度基线 8%
+                'pressure':    {'mape': 0.005},  # 气压非常稳定
+            },
+            probabilistic_targets=['temperature'],   # 只温度有区间
+        )
+
+        # 1) 一次记录所有目标
+        mtm.record_prediction(
+            timestamp=now,
+            predictions={'temperature': 25.3, 'humidity': 60.0, 'pressure': 1013.2},
+            y_lowers={'temperature': 24.0},        # 仅温度有区间
+            y_uppers={'temperature': 26.5},
+        )
+
+        # 2) 真值部分到达 (湿度传感器还没回数)
+        mtm.settle_actuals(
+            target_ts=now,
+            actuals={'temperature': 25.1, 'pressure': 1013.5},
+        )
+        # 后续湿度真值到了, 单独 settle:
+        mtm.settle_actual(
+            target_ts=now, target='humidity', y_actual=58.2,
+        )
+
+        # 3) 各目标查 MAPE
+        for tgt, m in mtm.current().items():
+            print(f'{tgt:12s}  MAPE={m["mape"]:.2%}')
+        # temperature   MAPE=0.79%
+        # humidity      MAPE=3.00%
+        # pressure      MAPE=0.03%
+    """
+
+    def __init__(
+        self,
+        model_id: str,
+        *,
+        targets: 'Any',
+        window_size: int = 100,
+        metric_window: int = 12,
+        metrics: Optional[List[str]] = None,
+        baseline_per_target: Optional[Mapping[str, Mapping[str, float]]] = None,
+        probabilistic_targets: Optional['Any'] = None,
+    ):
+        # 顶层模型标识, 内部各 PerformanceMonitor 名为 {model_id}_{target}
+        # / Parent model identifier
+        self.model_id = model_id
+        # 目标名列表 (保留顺序), e.g. ['temperature', 'humidity', 'pressure']
+        # / Ordered list of target names
+        self.targets: List[str] = [str(t) for t in targets]
+        if not self.targets:
+            raise ValueError('targets 不能为空')
+        if len(set(self.targets)) != len(self.targets):
+            raise ValueError(f'targets 包含重复: {self.targets}')
+
+        # 严格校验配置 — 早抛错胜过静默错误
+        # / Validate config — fail fast over silent error
+        baselines = dict(baseline_per_target or {})
+        prob_set = set(probabilistic_targets or [])
+        unknown_prob = prob_set - set(self.targets)
+        if unknown_prob:
+            raise ValueError(
+                f'probabilistic_targets 中有未声明的目标: {unknown_prob}; '
+                f'已声明 {self.targets}'
+            )
+        unknown_base = set(baselines) - set(self.targets)
+        if unknown_base:
+            raise ValueError(
+                f'baseline_per_target 中有未声明的目标: {unknown_base}; '
+                f'已声明 {self.targets}'
+            )
+
+        # 主存储: target_name → 独立的 PerformanceMonitor
+        # 每个目标独立的 baseline / 概率开关 / 指标窗口
+        # / Per-target performance monitor map; each target has independent config
+        self.per_target: Dict[str, PerformanceMonitor] = {
+            t: PerformanceMonitor(
+                f'{model_id}_{t}',
+                window_size=window_size,
+                metric_window=metric_window,
+                metrics=metrics,
+                baseline=baselines.get(t),
+                probabilistic=(t in prob_set),
+            )
+            for t in self.targets
+        }
+
+    # ------------------------------------------------------------------
+    # 写入
+    # ------------------------------------------------------------------
+    def record_prediction(
+        self,
+        *,
+        timestamp: datetime,
+        predictions: Mapping[str, float],
+        actuals: Optional[Mapping[str, float]] = None,
+        y_lowers: Optional[Mapping[str, float]] = None,
+        y_uppers: Optional[Mapping[str, float]] = None,
+    ) -> None:
+        """
+        一次记录多个目标 / Record a multi-target prediction in one shot.
+
+        Args:
+            timestamp:    本次预测的目标时点 (target_ts)
+            predictions:  ``{target_name: y_pred}``;
+                          支持只覆盖部分目标 (其他目标本时刻不记)
+            actuals:      ``{target_name: y_true}`` 同步可知的真值, 可选
+            y_lowers:     各目标的预测下界, 可选
+            y_uppers:     各目标的预测上界, 可选
+
+        Raises:
+            ValueError: predictions 中出现未声明的 target_name
+        """
+        actuals = dict(actuals or {})
+        y_lowers = dict(y_lowers or {})
+        y_uppers = dict(y_uppers or {})
+
+        unknown = set(predictions) - set(self.targets)
+        if unknown:
+            raise ValueError(
+                f'predictions 中有未声明的目标: {unknown}; '
+                f'已声明 {self.targets}'
+            )
+
+        for t, y_p in predictions.items():
+            self.per_target[t].update(
+                y_pred=float(y_p),
+                y_true=(None if t not in actuals
+                        else float(actuals[t])),
+                y_lower=(None if t not in y_lowers
+                         else float(y_lowers[t])),
+                y_upper=(None if t not in y_uppers
+                         else float(y_uppers[t])),
+                timestamp=timestamp,
+            )
+
+    def settle_actual(
+        self,
+        *,
+        target_ts: datetime,
+        target: str,
+        y_actual: float,
+    ) -> bool:
+        """
+        回填指定目标的真值 / Backfill actual for one target.
+
+        Returns:
+            True 若找到并回填; False 若该目标该 target_ts 已被淘汰出窗口
+
+        Raises:
+            ValueError: target 未声明
+        """
+        if target not in self.per_target:
+            raise ValueError(
+                f'未知目标 {target!r}; 已声明 {self.targets}'
+            )
+        return self.per_target[target].fill_actual(
+            target_ts=target_ts, y_true=float(y_actual),
+        )
+
+    def settle_actuals(
+        self,
+        *,
+        target_ts: datetime,
+        actuals: Mapping[str, float],
+    ) -> Dict[str, bool]:
+        """
+        一次回填多个目标 / Backfill multiple targets at one target_ts.
+
+        Returns:
+            ``{target: filled_or_not}`` — 每个目标是否成功回填
+        """
+        out: Dict[str, bool] = {}
+        for t, v in actuals.items():
+            out[t] = self.settle_actual(
+                target_ts=target_ts, target=t, y_actual=float(v),
+            )
+        return out
+
+    # ------------------------------------------------------------------
+    # 查询
+    # ------------------------------------------------------------------
+    def current(
+        self, window: Optional[int] = None,
+    ) -> Dict[str, Dict[str, float]]:
+        """各目标当前指标 / Per-target metrics dict."""
+        return {t: pm.current(window=window)
+                for t, pm in self.per_target.items()}
+
+    def compare_to_baseline(
+        self, window: Optional[int] = None,
+    ) -> Dict[str, Dict[str, float]]:
+        """各目标的 baseline 相对偏差 / Per-target relative_change vs baseline."""
+        return {t: pm.compare_to_baseline(window=window)
+                for t, pm in self.per_target.items()}
+
+    def snapshot(self, window: Optional[int] = None) -> Dict[str, Any]:
+        per_t = self.current(window=window)
+        used_window = (int(window) if window is not None
+                       else next(iter(self.per_target.values())).metric_window)
+        return {
+            'timestamp': datetime.now(),
+            'model_id': self.model_id,
+            'targets': self.targets,
+            'metric_window': used_window,
+            'per_target': per_t,
+            'n_settled_per_target': {
+                t: sum(1 for r in pm._records.values()
+                       if r.y_true is not None)
+                for t, pm in self.per_target.items()
+            },
+        }
+
+    def pending_targets(self) -> Dict[str, List[datetime]]:
+        """各目标中还未 settle 的 target_ts."""
+        return {t: pm.pending_targets()
+                for t, pm in self.per_target.items()}
+
+    def reset(self) -> None:
+        for pm in self.per_target.values():
+            pm.reset()
+
+    def __len__(self) -> int:
+        return sum(len(pm) for pm in self.per_target.values())
 
 
 # ==========================================================================

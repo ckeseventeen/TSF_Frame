@@ -106,6 +106,8 @@ from .alert_manager import (
 # ─────────────────── 性能 / Performance ────────────────────
 from .performance_monitor import (
     PerformanceMonitor,
+    MultiHorizonMonitor,
+    MultiTargetMonitor,
     mae, mse, rmse, mape, smape, r2,
     picp, miw, winkler,
 )
@@ -188,7 +190,7 @@ __all__ = [
     'AlertManager', 'ConsoleChannel', 'LoggingChannel', 'FileChannel',
     'CallbackChannel', 'StoreChannel',
     # 性能
-    'PerformanceMonitor',
+    'PerformanceMonitor', 'MultiHorizonMonitor', 'MultiTargetMonitor',
     'mae', 'mse', 'rmse', 'mape', 'smape', 'r2',
     'picp', 'miw', 'winkler',
     # 质量

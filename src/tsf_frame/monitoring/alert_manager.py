@@ -84,12 +84,26 @@ class AlertManager:
         store: Optional[MetricStore] = None,
         min_level: str = AlertLevel.INFO,
     ):
+        # 告警归属的模型/管道标识
+        # / Owning model identifier
         self.model_id = model_id
+        # 可选持久化后端; 设置后所有 emit 都会同步落库
+        # / Optional persistence backend
         self.store = store
+        # 全局最低级别过滤; 低于此级别的 emit 直接丢弃
+        # / Global minimum level — anything below is dropped at emit
         self.min_level = min_level
+        # 已挂载的告警通道列表 (Console / Logging / File / Callback / Store)
+        # / Mounted output channels (fan-out targets)
         self._channels: List[AlertChannel] = []
+        # 本地告警缓冲 (供 get_alerts 查询; 持久化交给 store 通道)
+        # / In-memory buffer for local query
         self._alerts: List[Alert] = []
+        # 单实例内的告警序号, 与微秒时间戳一起组成 alert_id 防重
+        # / Per-instance counter ensuring unique alert_id under same timestamp
         self._counter = 0
+        # 互斥锁, 保护 _counter 自增和 _alerts append
+        # / Mutex for thread-safe emit
         self._lock = threading.Lock()
 
     # ---- 通道管理 -----------------------------------------------------
@@ -225,7 +239,11 @@ class ConsoleChannel(AlertChannel, _LevelFilterMixin):
 
     def __init__(self, min_level: str = AlertLevel.INFO,
                  stream=None) -> None:
+        # 通道独立级别阈值 (与 AlertManager.min_level 取严)
+        # / Per-channel min level (stricter than manager's wins)
         self.min_level = min_level
+        # 输出流 (默认 stderr, 可替换为任意 file-like)
+        # / Output stream — defaults to sys.stderr
         self._stream = stream or sys.stderr
 
     def send(self, alert: Alert) -> None:
@@ -263,7 +281,11 @@ class LoggingChannel(AlertChannel, _LevelFilterMixin):
         name: str = 'tsf_frame.monitoring',
         min_level: str = AlertLevel.INFO,
     ):
+        # 通道级别阈值
+        # / Channel-level threshold
         self.min_level = min_level
+        # 标准 logging.Logger; 默认按 name 取一个全局 logger
+        # / Underlying stdlib logger (use given or look up by name)
         self.logger = logger or logging.getLogger(name)
 
     def send(self, alert: Alert) -> None:
@@ -291,10 +313,18 @@ class FileChannel(AlertChannel, _LevelFilterMixin):
         min_level: str = AlertLevel.WARNING,
         encoding: str = 'utf-8',
     ):
+        # 输出文件路径; 父目录会自动创建
+        # / Output file path; parent dir auto-created
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        # 通道级别阈值, 默认 WARNING (文件通常只记重要告警)
+        # / Channel-level threshold; default WARNING for noise reduction
         self.min_level = min_level
+        # 文件编码 (Windows 中文环境下显式 utf-8 防乱码)
+        # / Text encoding (utf-8 by default for non-ASCII safety)
         self.encoding = encoding
+        # 文件写入锁, 保证多线程下不交错
+        # / Mutex for thread-safe file append
         self._lock = threading.Lock()
 
     def send(self, alert: Alert) -> None:
@@ -322,7 +352,11 @@ class CallbackChannel(AlertChannel, _LevelFilterMixin):
         *,
         min_level: str = AlertLevel.INFO,
     ):
+        # 通道级别阈值
+        # / Channel-level threshold
         self.min_level = min_level
+        # 实际执行的回调函数, 接收 Alert 对象
+        # / The wrapped callable
         self._fn = fn
 
     def send(self, alert: Alert) -> None:
@@ -342,7 +376,11 @@ class StoreChannel(AlertChannel, _LevelFilterMixin):
 
     def __init__(self, store: MetricStore,
                  *, min_level: str = AlertLevel.INFO):
+        # 通道级别阈值
+        # / Channel-level threshold
         self.min_level = min_level
+        # 写入目标 MetricStore (可叠加多个 store, e.g. 同时写 SQLite 和 JSONL)
+        # / Target persistence backend
         self.store = store
 
     def send(self, alert: Alert) -> None:

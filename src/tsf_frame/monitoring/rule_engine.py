@@ -63,7 +63,11 @@ class Rule:
     子类可覆盖 ``__call__`` 或 ``evaluate`` 以实现复杂逻辑。
     """
 
+    # 规则唯一标识, 用于注册表 / 告警 source / 配置覆盖
+    # / Unique rule id used in registry and alert.source
     rule_id: str
+    # 默认告警级别 (具体规则可在 evaluate 时按情况升降)
+    # / Default severity used when rule fires
     severity: str = AlertLevel.WARNING
 
     def __call__(self, **kw) -> List[RuleViolation]:
@@ -217,11 +221,17 @@ class RuleEngine(RuleChecker):
         params: Optional[Mapping[str, Mapping[str, Any]]] = None,
         extra_rules: Optional[Mapping[str, Callable]] = None,
     ):
+        # 启用的规则 ID 列表 (顺序即检查顺序); None 时使用 DEFAULT_RULE_IDS
+        # / Active rule IDs (order = check order)
         self.rule_ids = list(rule_ids) if rule_ids is not None \
             else list(DEFAULT_RULE_IDS)
+        # 每条规则的固定参数 {rule_id: {kw}}, 例如 R2 的 max_ratio, R3 的 lo/hi
+        # / Per-rule kwargs forwarded to the rule callable
         self.params: Dict[str, Dict[str, Any]] = {
             k: dict(v) for k, v in (params or {}).items()
         }
+        # 临时规则映射 {rule_id: callable}, 不进全局注册表 (本实例独享)
+        # / Instance-local extra rules (not in the global registry)
         self._extra: Dict[str, Callable] = dict(extra_rules or {})
 
     # ---- 规则管理 -----------------------------------------------------

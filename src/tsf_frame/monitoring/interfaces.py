@@ -184,13 +184,29 @@ class Alert:
         acknowledged: 是否已被人工处理
     """
 
+    # 唯一 ID, 由 AlertManager 用 "{model_id}_{iso_ts}_{counter}" 构造防重
+    # / Globally unique alert id (used as primary key in store)
     alert_id: str
+    # 所属模型/管道标识, 用于按 model_id 过滤查询
+    # / Owning model identifier
     model_id: str
+    # 告警级别字符串 (AlertLevel.INFO / WARNING / ERROR / CRITICAL)
+    # / Severity level
     level: str
+    # 人类可读的告警信息 (展示给用户的主体文案)
+    # / Human-readable message
     message: str
+    # 告警产生时刻
+    # / Timestamp when the alert was emitted
     timestamp: datetime
+    # 告警来源标签 (rule_id / metric 名 / 组件名), 便于按来源过滤
+    # / Source tag (rule id / metric / component)
     source: str = ''
+    # 结构化上下文 (会被 JSON 序列化后存进 store; 任何额外信息往这放)
+    # / Arbitrary structured payload (JSON-serializable)
     details: Dict[str, Any] = field(default_factory=dict)
+    # 是否已被人工 ack 处理 (运维台用)
+    # / Whether the alert has been acknowledged by an operator
     acknowledged: bool = False
 
 
@@ -224,12 +240,26 @@ class DriftResult:
         details: 任意附加信息
     """
 
+    # 漂移类型 (DriftType.DATA / CONCEPT / PREDICTION)
+    # / Drift category
     drift_type: str
+    # 是否判定为漂移 (基于 score / p_value 综合判断)
+    # / Whether drift is detected
     detected: bool
+    # 建议告警级别, 与 detected=True 配合使用
+    # / Suggested alert level when detected
     severity: str = AlertLevel.WARNING
+    # 主要统计量 (如 PSI, KS stat, residual mean shift); 越大越严重
+    # / Primary statistic value
     score: float = 0.0
+    # 假设检验 p-value, 仅 KS 等检验类指标有
+    # / p-value if applicable (KS test, etc.)
     p_value: Optional[float] = None
+    # 多特征场景下每维得分 {feature_name: score}, 便于定位是哪一列在漂
+    # / Per-feature scores (multi-dim case)
     per_feature: Dict[str, float] = field(default_factory=dict)
+    # 任意附加信息 (检测窗口大小 / 参考数据规模 / 子统计量等)
+    # / Additional context
     details: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -247,11 +277,23 @@ class QualityIssue:
         details: 附加上下文
     """
 
+    # 问题代码 (MISSING / OUTLIER / SCHEMA / FREQ_DISCONTINUOUS / RANGE_BELOW_MIN ...)
+    # / Stable issue code for grouping
     issue_id: str
+    # 告警级别
+    # / Severity level
     severity: str
+    # 触发的列名; 全表/索引级问题留空
+    # / Affected column (empty for table-level issues)
     column: str = ''
+    # 人类可读描述 (展示给用户)
+    # / Human-readable message
     message: str = ''
+    # 量化指标值 (缺失率 / 异常占比 / 缺失期数等)
+    # / Quantitative metric value
     value: Optional[float] = None
+    # 附加上下文 (阈值 / 方法 / 样本示例等)
+    # / Additional details
     details: Dict[str, Any] = field(default_factory=dict)
 
 

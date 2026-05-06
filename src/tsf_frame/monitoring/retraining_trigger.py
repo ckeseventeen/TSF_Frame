@@ -54,10 +54,20 @@ class RetrainingRule:
         enabled: 是否启用
     """
 
+    # 规则唯一 ID, 写入 RetrainingDecision.triggered 列表
+    # / Unique rule id for tracking
     rule_id: str
+    # 规则分类标签, 用于过滤/统计 (如只看 drift 类)
+    # / Rule category for grouping/filtering
     kind: str
+    # 谓词函数: 接收 context dict 返回 bool; True 表示触发重训
+    # / Predicate function — context → bool (True = trigger)
     predicate: Callable[[Dict[str, Any]], bool]
+    # 命中后展示给用户的可读原因
+    # / Human-readable reason shown when fired
     reason: str = ''
+    # 是否启用 (False 时 check 跳过此规则)
+    # / Whether the rule is currently active
     enabled: bool = True
 
 
@@ -65,10 +75,20 @@ class RetrainingRule:
 class RetrainingDecision:
     """重训决策 / Decision bundle."""
 
+    # 是否建议重训 (任一规则命中即 True)
+    # / Whether retraining is recommended
     should_retrain: bool
+    # 命中规则的人类可读原因列表
+    # / Human-readable reasons (one per fired rule)
     reasons: List[str] = field(default_factory=list)
+    # 命中规则的 rule_id 列表
+    # / Fired rule ids
     triggered: List[str] = field(default_factory=list)
+    # 冷却期结束时刻; 在此时刻之前 should_retrain 强制为 False
+    # / End of cooldown window (if any)
     cooldown_until: Optional[datetime] = None
+    # 决策产生时刻
+    # / Decision timestamp
     checked_at: datetime = field(default_factory=datetime.now)
 
 
@@ -100,10 +120,16 @@ class RetrainingTrigger:
         *,
         cooldown_hours: float = 0.0,
     ):
+        # 规则列表; None 时使用 default_rules() 的 5 条通用规则
+        # / Active rules; defaults to 5 generic rules
         self.rules: List[RetrainingRule] = list(
             rules if rules is not None else self.default_rules()
         )
+        # 一次重训后的强制冷却期 (小时); 0 = 无冷却
+        # 防止短时间内反复触发抖动 / Cooldown to prevent thrashing
         self.cooldown_hours = float(cooldown_hours)
+        # 最近一次记录到的重训时刻 (record_retraining 设置); 用于计算冷却剩余时长
+        # / Timestamp of last recorded retraining
         self.last_retraining: Optional[datetime] = None
 
     # ---- 规则管理 -----------------------------------------------------

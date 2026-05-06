@@ -176,13 +176,27 @@ class DataDriftDetector(DriftDetector):
         ks_alpha: float = 0.05,
         feature_names: Optional[List[str]] = None,
     ):
+        # 参考期数据快照 (训练集特征), 形状 (N, d); None 时 detect() 直接返回未触发
+        # / Reference snapshot (training features); None disables detection
         self.reference = (None if reference is None
                           else np.atleast_2d(np.asarray(reference)))
+        # 当前窗口长度 (推入 _buf 的最大行数)
+        # / Sliding window size for accumulated current data
         self.window_size = int(window_size)
+        # PSI 警告阈值, > 此值即 WARNING
+        # / PSI threshold for WARNING level
         self.psi_warn = float(psi_warn)
+        # PSI 严重阈值, > 此值即 CRITICAL
+        # / PSI threshold for CRITICAL level
         self.psi_crit = float(psi_crit)
+        # KS 检验显著性 α, p < α 也判定漂移
+        # / KS test significance level
         self.ks_alpha = float(ks_alpha)
+        # 特征名列表 (用于报告时人类可读); None 时用 f0/f1/...
+        # / Optional feature names for reports
         self.feature_names = list(feature_names) if feature_names else None
+        # 当前窗口缓冲 (FIFO, 满了自动丢弃最旧)
+        # / Current-window buffer (FIFO eviction)
         self._buf: Deque[np.ndarray] = deque(maxlen=self.window_size)
 
     def set_reference(self, reference: np.ndarray) -> None:
@@ -278,11 +292,23 @@ class ConceptDriftDetector(DriftDetector):
         var_ratio_warn: float = 2.0,
         var_ratio_crit: float = 4.0,
     ):
+        # 滑窗大小 (累积当前残差的 FIFO 窗口)
+        # / Window for current residuals
         self.window_size = int(window_size)
+        # 残差均值偏离阈值 (单位: 参考标准差倍数), 默认 3σ
+        # / Mean shift threshold in σ units
         self.mean_shift_std = float(mean_shift_std)
+        # 残差方差扩大警告阈值 (current_var / reference_var)
+        # / Variance ratio threshold for WARNING
         self.var_ratio_warn = float(var_ratio_warn)
+        # 残差方差扩大严重阈值
+        # / Variance ratio threshold for CRITICAL
         self.var_ratio_crit = float(var_ratio_crit)
+        # 参考期残差数组 (set_reference 设置); None 时只能算趋势, 不能比对参考
+        # / Reference residual snapshot
         self._ref_residuals: Optional[np.ndarray] = None
+        # 当前残差累积窗口
+        # / Current residual buffer (FIFO)
         self._buf: Deque[float] = deque(maxlen=self.window_size)
 
     def set_reference(self, residuals: np.ndarray) -> None:
@@ -382,11 +408,19 @@ class PredictionDriftDetector(DriftDetector):
         psi_warn: float = 0.1,
         psi_crit: float = 0.25,
     ):
+        # 参考期 y_pred 数组 (一般是验证集预测), 1D
+        # / Reference predictions distribution
         self.reference = (None if reference is None
                           else np.asarray(reference, dtype=float).ravel())
+        # 当前窗口大小
+        # / Current-window size
         self.window_size = int(window_size)
+        # PSI WARNING / CRITICAL 阈值
+        # / PSI thresholds
         self.psi_warn = float(psi_warn)
         self.psi_crit = float(psi_crit)
+        # 当前 y_pred 累积窗口 (FIFO)
+        # / Current predictions buffer
         self._buf: Deque[float] = deque(maxlen=self.window_size)
 
     def set_reference(self, reference: np.ndarray) -> None:
