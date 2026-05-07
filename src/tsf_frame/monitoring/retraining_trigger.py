@@ -52,6 +52,12 @@ class RetrainingRule:
         predicate: callable(context) -> bool
         reason:  命中时展示的说明
         enabled: 是否启用
+        Rule ID	类型	触发条件	说明
+mape_hard	Performance	MAPE > 15%	性能硬阈值：误差太大必须重训
+concept_drift	Drift	concept_drift 为 True	概念漂移：数据分布规律变了
+data_and_perf	Drift	数据漂移 且 MAPE > 10%	组合条件：数据变了 + 性能降了
+volume_based	Volume	新样本 ≥ 1000 个	数据量驱动：积累了足够多新数据
+time_based	Time	距上次训练 ≥ 30 天	时间驱动：定期刷新模型
     """
 
     # 规则唯一 ID, 写入 RetrainingDecision.triggered 列表

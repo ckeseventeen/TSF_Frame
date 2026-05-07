@@ -29,7 +29,7 @@ import warnings
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
@@ -335,7 +335,13 @@ class PerformanceMonitor:
             y_lower=None if y_lower is None else float(y_lower),
             y_upper=None if y_upper is None else float(y_upper),
         )
-
+    # 解耦预测和验证
+    # 假设你在 2026-05-01 预测了 2026-05-06 的销量。到了今天（2026-05-06），真实的销量数据产生了。
+    # 行为：你调用 fill_actual(target_ts=2026-05-06, y_true=实际销量)。
+    # 逻辑：
+    # 它去内存的 _records 字典里，查找 target_ts 为 2026-05-06 的那条记录。
+    # 如果找到了，就把 y_true 填进去（rec.y_true = float(y_true)），返回 True。
+    # 如果没找到（比如窗口已满，那条记录已经被淘汰了），返回 False。
     def fill_actual(
         self,
         target_ts: Union[datetime, int],
@@ -567,7 +573,7 @@ class MultiHorizonMonitor:
         self,
         model_id: str,
         *,
-        horizons: 'Any' = tuple(range(1, 13)),
+        horizons: Sequence[int] = tuple(range(1, 13)),
         window_size: int = 100,
         metric_window: int = 12,
         metrics: Optional[List[str]] = None,
@@ -606,10 +612,10 @@ class MultiHorizonMonitor:
         self,
         *,
         forecast_time: datetime,
-        predictions: 'Any',
-        target_times: Optional['Any'] = None,
-        y_lower: Optional['Any'] = None,
-        y_upper: Optional['Any'] = None,
+        predictions: Sequence[float],
+        target_times: Optional[Sequence[datetime]] = None,
+        y_lower: Optional[Sequence[float]] = None,
+        y_upper: Optional[Sequence[float]] = None,
     ) -> None:
         """
         记录一次完整多步预测 / Record one batch of horizon forecasts.
@@ -853,12 +859,12 @@ class MultiTargetMonitor:
         self,
         model_id: str,
         *,
-        targets: 'Any',
+        targets: Sequence[str],
         window_size: int = 100,
         metric_window: int = 12,
         metrics: Optional[List[str]] = None,
         baseline_per_target: Optional[Mapping[str, Mapping[str, float]]] = None,
-        probabilistic_targets: Optional['Any'] = None,
+        probabilistic_targets: Optional[Sequence[str]] = None,
     ):
         # 顶层模型标识, 内部各 PerformanceMonitor 名为 {model_id}_{target}
         # / Parent model identifier
