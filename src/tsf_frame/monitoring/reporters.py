@@ -187,13 +187,14 @@ class PlotReport(ReportGenerator):
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
 
-        # 中文字体 (若可用)
+        # 复用项目统一的 PredictionPlotter (内含中文字体配置)
+        # 若 visualization 模块不可用则降级到原生 matplotlib (生产环境无影响)
         try:
-            from ..visualization.base_visualizer import _CN_FONTS
-            plt.rcParams['font.sans-serif'] = _CN_FONTS
-            plt.rcParams['axes.unicode_minus'] = False
-        except Exception:
-            pass
+            from ..visualization import PredictionPlotter
+        except Exception:  # pragma: no cover
+            PredictionPlotter = None  # type: ignore
+
+        plotter = PredictionPlotter() if PredictionPlotter else None
 
         start, end = _default_window(days)
         preds = store.query_predictions(model_id=model_id,
@@ -210,7 +211,7 @@ class PlotReport(ReportGenerator):
             fontsize=14, fontweight='bold',
         )
 
-        # [1] 预测 vs 实际
+        # [1] 预测 vs 实际 (含 95% 区间)
         ax = axes[0, 0]
         if preds:
             xs = [p['timestamp'] for p in preds]
@@ -218,31 +219,43 @@ class PlotReport(ReportGenerator):
             ya = [p.get('y_actual') for p in preds]
             lo = [p.get('y_lower') for p in preds]
             hi = [p.get('y_upper') for p in preds]
-            ax.plot(xs, yp, '-', color='tab:blue', label='预测', linewidth=1.2)
-            if all(v is not None for v in lo + hi):
-                ax.fill_between(xs, lo, hi, color='tab:blue',
-                                alpha=0.15, label='区间')
-            if any(v is not None for v in ya):
-                xs2 = [x for x, v in zip(xs, ya) if v is not None]
-                ys2 = [v for v in ya if v is not None]
-                ax.plot(xs2, ys2, 'o-', color='tab:orange',
-                        markersize=3, label='实际')
-            ax.legend(loc='best', fontsize=8)
+            has_band = all(v is not None for v in lo + hi)
+            if plotter and has_band:
+                plotter.interval_band(
+                    ax, x=xs, y_pred=yp, y_lower=lo, y_upper=hi,
+                    y_actual=[v if v is not None else float('nan') for v in ya]
+                    if any(v is not None for v in ya) else None,
+                    mean_label='预测', actual_label='实际',
+                    band_label='区间', band_alpha=0.15,
+                )
+            else:
+                ax.plot(xs, yp, '-', label='预测', linewidth=1.2)
+                if any(v is not None for v in ya):
+                    xs2 = [x for x, v in zip(xs, ya) if v is not None]
+                    ys2 = [v for v in ya if v is not None]
+                    ax.plot(xs2, ys2, 'o-', markersize=3, label='实际')
+                ax.legend(loc='best', fontsize=8)
         ax.set_title('[1] 预测 vs 实际', fontsize=10)
         ax.tick_params(axis='x', rotation=30, labelsize=7)
 
-        # [2] 残差
+        # [2] 残差时序
         ax = axes[0, 1]
         resid = [(p['timestamp'], p['y_actual'] - p['y_pred'])
                  for p in preds if p.get('y_actual') is not None]
         if resid:
             xs, rs = zip(*resid)
-            ax.plot(xs, rs, 'o-', color='tab:red', markersize=2, linewidth=0.8)
-            ax.axhline(0, linestyle='--', color='gray', linewidth=0.8)
-        ax.set_title('[2] 残差 (actual - pred)', fontsize=10)
+            if plotter:
+                plotter.residuals(ax, x=list(xs), residuals=list(rs),
+                                  title='[2] 残差 (actual - pred)')
+            else:
+                ax.plot(xs, rs, 'o-', markersize=2, linewidth=0.8)
+                ax.axhline(0, linestyle='--', color='gray', linewidth=0.8)
+                ax.set_title('[2] 残差 (actual - pred)', fontsize=10)
+        else:
+            ax.set_title('[2] 残差 (actual - pred)', fontsize=10)
         ax.tick_params(axis='x', rotation=30, labelsize=7)
 
-        # [3] 指标趋势
+        # [3] 指标趋势 (Top 3 最常出现的指标)
         ax = axes[1, 0]
         by_name: Dict[str, List[Tuple[datetime, float]]] = {}
         for m in metrics:
@@ -258,44 +271,67 @@ class PlotReport(ReportGenerator):
         ax.set_title('[3] 指标趋势 (Top 3)', fontsize=10)
         ax.tick_params(axis='x', rotation=30, labelsize=7)
 
-        # [4] 告警时间线
+        # [4] 告警时间线 (按级别着色, 走 plotter.scatter_categorical)
         ax = axes[1, 1]
-        color_map = {
-            AlertLevel.INFO: 'tab:gray',
-            AlertLevel.WARNING: 'tab:orange',
-            AlertLevel.ERROR: 'tab:red',
-            AlertLevel.CRITICAL: 'darkred',
-        }
         if alerts:
-            for a in alerts:
-                ax.scatter(a.timestamp,
-                           LEVEL_ORDER.get(a.level, 0),
-                           color=color_map.get(a.level, 'tab:gray'),
-                           s=25, alpha=0.7)
-            ax.set_yticks(list(LEVEL_ORDER.values()))
-            ax.set_yticklabels(list(LEVEL_ORDER.keys()))
-        ax.set_title('[4] 告警时间线', fontsize=10)
+            if plotter:
+                plotter.scatter_categorical(
+                    ax,
+                    x=[a.timestamp for a in alerts],
+                    y=[LEVEL_ORDER.get(a.level, 0) for a in alerts],
+                    color_by=[a.level for a in alerts],
+                    yticks=list(LEVEL_ORDER.values()),
+                    yticklabels=list(LEVEL_ORDER.keys()),
+                    title='[4] 告警时间线',
+                )
+            else:
+                color_map = {AlertLevel.INFO: 'tab:gray',
+                             AlertLevel.WARNING: 'tab:orange',
+                             AlertLevel.ERROR: 'tab:red',
+                             AlertLevel.CRITICAL: 'darkred'}
+                for a in alerts:
+                    ax.scatter(a.timestamp, LEVEL_ORDER.get(a.level, 0),
+                               color=color_map.get(a.level, 'tab:gray'),
+                               s=25, alpha=0.7)
+                ax.set_yticks(list(LEVEL_ORDER.values()))
+                ax.set_yticklabels(list(LEVEL_ORDER.keys()))
+                ax.set_title('[4] 告警时间线', fontsize=10)
+        else:
+            ax.set_title('[4] 告警时间线', fontsize=10)
         ax.tick_params(axis='x', rotation=30, labelsize=7)
 
-        # [5] 告警级别直方图
+        # [5] 告警级别计数
         ax = axes[2, 0]
         dist = {lv: 0 for lv in LEVEL_ORDER}
         for a in alerts:
             dist[a.level] = dist.get(a.level, 0) + 1
         names = list(dist.keys())
         values = [dist[n] for n in names]
-        colors = [color_map.get(n, 'gray') for n in names]
-        ax.bar(names, values, color=colors)
-        for i, v in enumerate(values):
-            ax.text(i, v, str(v), ha='center', va='bottom', fontsize=8)
-        ax.set_title('[5] 告警分级计数', fontsize=10)
+        level_colors = ['tab:gray', 'tab:orange', 'tab:red', 'darkred']
+        if plotter:
+            plotter.bars(
+                ax, names=names, values=values,
+                fmt='{:.0f}', color=level_colors[:len(names)],
+                title='[5] 告警分级计数', text_fontsize=8,
+            )
+        else:
+            ax.bar(names, values, color=level_colors[:len(names)])
+            for i, v in enumerate(values):
+                ax.text(i, v, str(v), ha='center', va='bottom', fontsize=8)
+            ax.set_title('[5] 告警分级计数', fontsize=10)
 
-        # [6] 预测分布
+        # [6] 预测值分布
         ax = axes[2, 1]
         if preds:
-            ax.hist([p['y_pred'] for p in preds], bins=30,
-                    color='tab:blue', alpha=0.6, edgecolor='white')
-        ax.set_title('[6] 预测值分布', fontsize=10)
+            yp = [p['y_pred'] for p in preds]
+            if plotter:
+                plotter.histogram(ax, values=yp, bins=30,
+                                  title='[6] 预测值分布')
+            else:
+                ax.hist(yp, bins=30, alpha=0.6, edgecolor='white')
+                ax.set_title('[6] 预测值分布', fontsize=10)
+        else:
+            ax.set_title('[6] 预测值分布', fontsize=10)
 
         fig.tight_layout(rect=[0, 0, 1, 0.96])
 
@@ -307,7 +343,10 @@ class PlotReport(ReportGenerator):
                 f'report_{model_id}_{datetime.now():%Y%m%d_%H%M%S}.png',
             )
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(out_path, dpi=150, bbox_inches='tight')
+        if plotter:
+            plotter.save(fig, out_path, dpi=150)
+        else:
+            fig.savefig(out_path, dpi=150, bbox_inches='tight')
         plt.close(fig)
         return out_path
 

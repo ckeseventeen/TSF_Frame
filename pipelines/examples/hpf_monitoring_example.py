@@ -33,11 +33,17 @@ import sys
 import warnings
 warnings.filterwarnings('ignore')
 
-# ------ sys.path 引导 ------
+# ------ sys.path 引导 + 项目根锚定 ------
+# 项目根 = 包含 configs/ 和 src/ 的最近祖先目录, 不依赖 CWD.
+# 这样无论从命令行还是 IDE 直接 Run 此文件, 日志都落在 <root>/logs/ 下,
+# 不会出现 pipelines/examples/logs 这种 CWD 飞地.
+# / Project root anchor; CWD-independent so logs always land in <root>/logs/
 from pathlib import Path as _Path
 _HERE = _Path(__file__).resolve()
+_PROJECT_ROOT = _HERE.parent  # 兜底
 for _p in (_HERE.parent, *_HERE.parents):
     if (_p / 'configs').is_dir() and (_p / 'src').is_dir():
+        _PROJECT_ROOT = _p
         for _q in (_p, _p / 'src'):
             if str(_q) not in sys.path:
                 sys.path.insert(0, str(_q))
@@ -181,9 +187,10 @@ def build_hpf_monitor(
     # --- 持久化: SQLite ---
     store = SQLiteStore(db_path=cfg_mon.sqlite_path)
 
-    # --- 性能监控: 窗口 = window_months, MAPE 百分比形式 ---
-    # 注意: mape 指标在 monitoring.performance_monitor 里是小数 (0.1=10%),
-    # 而 HPFMonitoringConfig 是百分比 (10.0=10%). 构造时统一换算为小数.
+    # --- 性能监控: 窗口 = window_months, 全项目 MAPE 量纲统一为小数 ---
+    # mape 指标 (monitoring.mape / MetricsCalculator.mape) 和
+    # HPFMonitoringConfig.mape_warning / mape_critical 都是**小数形式** (0.10=10%),
+    # 不再需要 ×100 换算. 展示时用 f'{value:.2%}'.
     perf = PerformanceMonitor(
         model_id=model_id,
         window_size=cfg_mon.window_months,
@@ -195,7 +202,7 @@ def build_hpf_monitor(
     # --- 漂移 ---
     data_drift = DataDriftDetector(
         reference=reference_features,
-        window_size=cfg_mon.window_months * 2,
+        window_size=cfg_mon.window_months * 2,  # 漂移检测窗口是性能窗口的2倍
         psi_warn=cfg_mon.psi_warning,
         psi_crit=cfg_mon.psi_critical,
         ks_alpha=cfg_mon.ks_pvalue,
@@ -243,14 +250,17 @@ def build_hpf_monitor(
     )
 
     # --- 重训触发: 用 HPF 特化阈值替换默认 mape_hard ---
+    # 量纲约定: cfg_mon.mape_critical / mape_warning 都是**小数** (0.10 / 0.15),
+    # metrics['mape'] 也是小数, 直接比较, 无需手工 *100 转换.
+    # / Both thresholds and metrics are decimals; direct comparison.
     retrain = RetrainingTrigger([
         RetrainingRule(
             rule_id='mape_hpf_critical',
             kind='performance',
             predicate=lambda c: (
                 c.get('performance', {}).get('mape', 0)
-                * 100 > cfg_mon.mape_critical),
-            reason=f'MAPE > {cfg_mon.mape_critical}%',
+                > cfg_mon.mape_critical),
+            reason=f'MAPE > {cfg_mon.mape_critical:.0%}',
         ),
         RetrainingRule(
             rule_id='concept_drift',
@@ -264,7 +274,7 @@ def build_hpf_monitor(
             predicate=lambda c: (
                 bool(c.get('data_drift')) and
                 c.get('performance', {}).get('mape', 0)
-                * 100 > cfg_mon.mape_warning),
+                > cfg_mon.mape_warning),
             reason='数据漂移 + MAPE 超警戒',
         ),
     ], cooldown_hours=24.0)
@@ -306,7 +316,10 @@ def build_hpf_monitor(
 # =====================================================================
 
 def main():
-    logger = get_logger('hpf_monitoring_example', log_dir='./logs/runs')
+    logger = get_logger(
+        'hpf_monitoring_example',
+        log_dir=str(_PROJECT_ROOT / 'logs' / 'runs'),
+    )
     logger.info('=' * 70)
     logger.info('  HPF 端到端监控演示 (generic ModelMonitor stack)')
     logger.info('=' * 70)
@@ -375,7 +388,7 @@ def main():
     val_mape = float(np.mean(np.abs((val_y_orig - val_preds_orig)
                                     / np.where(val_y_orig == 0, 1,
                                                val_y_orig))))
-    logger.info(f'     val MAPE (orig scale) = {val_mape:.4f}')
+    logger.info(f'     val MAPE (orig scale) = {val_mape:.2%}')
 
     # ── 5) 装配监控栈 ────────────────────────────────────────────
     logger.info('[5/7] 装配监控栈 (ModelMonitor + HPF 规则注入)')

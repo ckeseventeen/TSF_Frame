@@ -33,8 +33,8 @@ import pandas as pd
 import matplotlib
 matplotlib.use('Agg')  # 无界面环境下也能运行（须在 import pyplot 之前设置）
 import matplotlib.pyplot as plt
-from tsf_frame.visualization.base_visualizer import _CN_FONTS  # 复用统一中文字体配置
-matplotlib.rcParams['font.sans-serif'] = _CN_FONTS
+# 统一画图入口 (import 即激活中文字体 rcParams)
+from tsf_frame.visualization import PredictionPlotter
 matplotlib.rcParams['axes.unicode_minus'] = False
 from datetime import datetime
 
@@ -228,7 +228,7 @@ def train_and_evaluate(
     y_pred_orig = adapter._denormalize(y_pred_df, metadata)[target_col].values
     metrics = MetricsCalculator.calculate_all(y_test_orig, y_pred_orig)
 
-    logger.info(f'    MAE={metrics["MAE"]:.4f}  MAPE={metrics["MAPE"]:.2f}%  R2={metrics["R2"]:.4f}')
+    logger.info(f'    MAE={metrics["MAE"]:.4f}  MAPE={metrics["MAPE"]:.2%}  R2={metrics["R2"]:.4f}')
 
     return {
         'model': model,
@@ -240,6 +240,17 @@ def train_and_evaluate(
 
 # ─── 4. 可视化 ────────────────────────────────────────────────────────────────
 
+#: 模块级单例 plotter (复用,避免重复 init)
+_PLOTTER = PredictionPlotter(figsize=(14, 10), dpi=120)
+
+
+def _yunit(target_col: str) -> str:
+    """根据目标列推断 y 轴单位."""
+    if any(k in target_col for k in ('deposit', 'withdrawal', 'loan')):
+        return '亿元'
+    return '万人'
+
+
 def plot_forecast_comparison(
     y_true: np.ndarray,
     results: dict,
@@ -247,73 +258,47 @@ def plot_forecast_comparison(
     target_col: str,
     save_path: str,
 ):
-    """对比多个模型预测结果。"""
-    fig, axes = plt.subplots(2, 1, figsize=(14, 10))
-
-    # 上图：预测对比
-    ax = axes[0]
-    ax.plot(dates, y_true, 'k-', linewidth=2, label='实际值', zorder=5)
-    colors = ['#E74C3C', '#3498DB', '#2ECC71', '#F39C12']
-    for i, (model_name, res) in enumerate(results.items()):
-        color = colors[i % len(colors)]
-        ax.plot(dates, res['y_pred'], '--', color=color, alpha=0.8,
-                label=f'{model_name} (MAPE={res["metrics"]["MAPE"]:.1f}%)')
-    ax.set_title(f'公积金 {target_col} 预测对比', fontsize=13)
-    ax.set_ylabel('亿元' if 'deposit' in target_col or 'withdrawal' in target_col
-                  or 'loan' in target_col else '万人')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-
-    # 下图：最优模型概率预测（置信区间）
+    """对比多个模型预测结果 (调用统一 PredictionPlotter)."""
+    # 多模型预测
+    models_pred = {
+        f'{name} (MAPE={res["metrics"]["MAPE"]:.2%})': res['y_pred']
+        for name, res in results.items()
+    }
+    # 最优模型 + 概率区间
     best_name = min(results, key=lambda k: results[k]['metrics']['MAPE'])
     best = results[best_name]
-    ax2 = axes[1]
-    ax2.plot(dates, y_true, 'k-', linewidth=2, label='实际值')
-    ax2.plot(dates, best['y_pred'], 'r--', linewidth=1.5,
-             label=f'{best_name} 预测均值')
+    best_interval = None
+    prob = best.get('prob_result')
+    if prob is not None and prob.lower is not None and prob.upper is not None:
+        best_interval = (
+            best['y_pred'],
+            prob.lower.flatten(),
+            prob.upper.flatten(),
+        )
 
-    prob = best['prob_result']
-    if prob.lower is not None and prob.upper is not None:
-        lower = prob.lower.flatten()
-        upper = prob.upper.flatten()
-        ax2.fill_between(dates, lower, upper, alpha=0.25, color='red',
-                         label='95% 置信区间')
-
-    ax2.set_title(f'最优模型（{best_name}）概率预测', fontsize=13)
-    ax2.set_ylabel('亿元 / 万人')
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=120, bbox_inches='tight')
-    plt.close()
+    _PLOTTER.forecast_comparison_fig(
+        x=dates, y_true=y_true,
+        models_pred=models_pred,
+        best_interval=best_interval,
+        target_label=target_col, ylabel=_yunit(target_col),
+        save_path=save_path,
+    )
 
 
 def plot_metrics_comparison(results: dict, save_path: str):
-    """指标对比柱状图。"""
+    """MAPE / R² 对比柱状图 (统一 PredictionPlotter.metrics_bars_fig)."""
     models = list(results.keys())
-    mape_vals = [results[m]['MAPE'] for m in models]
-    r2_vals = [results[m]['R2'] for m in models]
-
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-
-    colors = ['#E74C3C', '#3498DB', '#2ECC71', '#F39C12']
-    axes[0].bar(models, mape_vals, color=colors[:len(models)], alpha=0.8)
-    axes[0].set_title('MAPE（越低越好）', fontsize=12)
-    axes[0].set_ylabel('%')
-    for i, v in enumerate(mape_vals):
-        axes[0].text(i, v + 0.05, f'{v:.2f}%', ha='center', fontsize=10)
-
-    axes[1].bar(models, r2_vals, color=colors[:len(models)], alpha=0.8)
-    axes[1].set_title('R² 决定系数（越高越好）', fontsize=12)
-    axes[1].set_ylabel('R²')
-    for i, v in enumerate(r2_vals):
-        axes[1].text(i, v + 0.005, f'{v:.4f}', ha='center', fontsize=10)
-
-    plt.suptitle('公积金预测模型性能对比', fontsize=14)
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=120, bbox_inches='tight')
-    plt.close()
+    _PLOTTER.metrics_bars_fig(
+        groups={
+            'MAPE(越低越好)': (
+                models, [results[m]['MAPE'] for m in models], '{:.2%}'),
+            'R² 决定系数(越高越好)': (
+                models, [results[m]['R2'] for m in models], '{:.4f}'),
+        },
+        suptitle='公积金预测模型性能对比',
+        figsize=(12, 5),
+        save_path=save_path,
+    )
 
 
 def plot_policy_scenario(
@@ -323,23 +308,21 @@ def plot_policy_scenario(
     target_col: str,
     save_path: str,
 ):
-    """政策情景分析图。"""
+    """政策情景分析图 (单图: 基准 + 多情景虚线对比)."""
     fig, ax = plt.subplots(figsize=(12, 6))
-    ax.plot(dates, base_forecast[target_col].values, 'k-', linewidth=2,
-            label='基准预测（无政策调整）')
-
-    colors = ['#E74C3C', '#3498DB', '#2ECC71']
-    for i, (scenario_name, adjusted) in enumerate(policy_scenarios.items()):
-        ax.plot(dates, adjusted[target_col].values, '--',
-                color=colors[i % len(colors)], alpha=0.85, label=scenario_name)
-
-    ax.set_title(f'公积金 {target_col} 政策情景分析', fontsize=13)
-    ax.set_ylabel('亿元 / 万人')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=120, bbox_inches='tight')
-    plt.close()
+    _PLOTTER.lines_compare(
+        ax,
+        x=dates,
+        baseline=base_forecast[target_col].values,
+        baseline_label='基准预测(无政策调整)',
+        series={name: adj[target_col].values
+                for name, adj in policy_scenarios.items()},
+        title=f'公积金 {target_col} 政策情景分析',
+        ylabel=_yunit(target_col),
+    )
+    fig.tight_layout()
+    _PLOTTER.save(fig, save_path)
+    plt.close(fig)
 
 
 # ─── 5. 主流程 ────────────────────────────────────────────────────────────────
@@ -485,16 +468,15 @@ def main():
         if feat_imp is not None:
             logger.info(f'  Top 10 重要特征:\n{feat_imp.head(10).to_string(index=False)}')
 
-            # 绘制特征重要性
-            fig, ax = plt.subplots(figsize=(10, 6))
-            top10 = feat_imp.head(10)
-            ax.barh(top10['feature'][::-1], top10['importance'][::-1], color='#3498DB', alpha=0.8)
-            ax.set_title('XGBoost 特征重要性 Top-10', fontsize=13)
-            ax.set_xlabel('Importance Score')
-            ax.grid(True, alpha=0.3, axis='x')
-            plt.tight_layout()
-            plt.savefig(os.path.join(output_dir, 'hpf_feature_importance.png'), dpi=120)
-            plt.close()
+            # 特征重要性 Top-10
+            _PLOTTER.feature_importance_fig(
+                names=feat_imp['feature'].tolist(),
+                values=feat_imp['importance'].tolist(),
+                top_n=10,
+                title='XGBoost 特征重要性 Top-10',
+                xlabel='Importance Score',
+                save_path=os.path.join(output_dir, 'hpf_feature_importance.png'),
+            )
 
     # ── Step 9: 可视化 ────────────────────────────────────────────────────
     logger.info('\n[Step 9] 生成可视化图表...')
@@ -573,7 +555,7 @@ def main():
     logger.info(f'  测试集范围  : {test_dates[0].date()} ~ {test_dates[-1].date()}')
     logger.info(f'  参与对比模型: {list(results.keys())}')
     logger.info(f'  最优模型    : {best_name}')
-    logger.info(f'  最优 MAPE   : {results[best_name]["metrics"]["MAPE"]:.2f}%')
+    logger.info(f'  最优 MAPE   : {results[best_name]["metrics"]["MAPE"]:.2%}')
     logger.info(f'  最优 R2     : {results[best_name]["metrics"]["R2"]:.4f}')
     logger.info(f'\n  输出文件保存至: {output_dir}')
     logger.info('=' * 65)

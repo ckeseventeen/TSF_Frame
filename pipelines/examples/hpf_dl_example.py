@@ -44,9 +44,8 @@ import torch
 import matplotlib
 matplotlib.use('Agg')  # 无界面环境下也能运行(须在 import pyplot 之前设置)
 import matplotlib.pyplot as plt
-from tsf_frame.visualization.base_visualizer import _CN_FONTS  # 复用统一中文字体配置
-matplotlib.rcParams['font.sans-serif'] = _CN_FONTS
-matplotlib.rcParams['axes.unicode_minus'] = False
+# 统一画图入口 (import 即激活中文字体 rcParams)
+from tsf_frame.visualization import PredictionPlotter
 
 from configs.hpf.hpf_config import HPFConfig
 from tsf_frame.business.hpf_adapter import HPFAdapter
@@ -245,7 +244,7 @@ def train_and_evaluate_dl(
     metrics = MetricsCalculator.calculate_all(y_test_orig, y_pred_orig)
 
     logger.info(
-        f'    MAE={metrics["MAE"]:.4f}  MAPE={metrics["MAPE"]:.2f}%  '
+        f'    MAE={metrics["MAE"]:.4f}  MAPE={metrics["MAPE"]:.2%}  '
         f'R2={metrics["R2"]:.4f}  final_train_loss={history["train_loss"][-1]:.5f}'
     )
 
@@ -260,6 +259,16 @@ def train_and_evaluate_dl(
 
 # ─── 4. 可视化 ────────────────────────────────────────────────────────────────
 
+#: 模块级 plotter 单例
+_PLOTTER = PredictionPlotter(figsize=(14, 10), dpi=120)
+
+
+def _yunit(target_col: str) -> str:
+    if any(k in target_col for k in ('deposit', 'withdrawal', 'loan')):
+        return '亿元'
+    return '万人'
+
+
 def plot_forecast_comparison(
     y_true: np.ndarray,
     results: dict,
@@ -267,106 +276,60 @@ def plot_forecast_comparison(
     target_col: str,
     save_path: str,
 ):
-    """对比多个 DL 模型预测结果(均值+置信区间)。"""
-    fig, axes = plt.subplots(2, 1, figsize=(14, 10))
-
-    # 上图: 预测对比
-    ax = axes[0]
-    ax.plot(dates, y_true, 'k-', linewidth=2, label='实际值', zorder=5)
-    colors = ['#E74C3C', '#3498DB', '#2ECC71', '#F39C12', '#9B59B6']
-    for i, (model_name, res) in enumerate(results.items()):
-        color = colors[i % len(colors)]
-        ax.plot(dates, res['y_pred'], '--', color=color, alpha=0.8,
-                label=f'{model_name} (MAPE={res["metrics"]["MAPE"]:.1f}%)')
-    ax.set_title(f'公积金 {target_col} 深度学习模型预测对比', fontsize=13)
-    ax.set_ylabel('亿元' if 'deposit' in target_col or 'withdrawal' in target_col
-                  or 'loan' in target_col else '万人')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-
-    # 下图: 最优模型 MC Dropout 置信区间
+    """DL 多模型预测对比 + MC Dropout 概率区间."""
+    models_pred = {
+        f'{name} (MAPE={res["metrics"]["MAPE"]:.2%})': res['y_pred']
+        for name, res in results.items()
+    }
     best_name = min(results, key=lambda k: results[k]['metrics']['MAPE'])
     best = results[best_name]
-    ax2 = axes[1]
-    ax2.plot(dates, y_true, 'k-', linewidth=2, label='实际值')
-    ax2.plot(dates, best['y_pred'], 'r--', linewidth=1.5,
-             label=f'{best_name} 预测均值')
-
-    prob = best['prob_result']
-    if prob.lower is not None and prob.upper is not None:
-        lower = prob.lower.flatten()
-        upper = prob.upper.flatten()
-        ax2.fill_between(dates, lower, upper, alpha=0.25, color='red',
-                         label='95% 置信区间 (MC Dropout)')
-
-    ax2.set_title(f'最优模型({best_name})MC Dropout 概率预测', fontsize=13)
-    ax2.set_ylabel('亿元 / 万人')
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=120, bbox_inches='tight')
-    plt.close()
+    best_interval = None
+    prob = best.get('prob_result')
+    if prob is not None and prob.lower is not None and prob.upper is not None:
+        best_interval = (
+            best['y_pred'],
+            prob.lower.flatten(),
+            prob.upper.flatten(),
+        )
+    _PLOTTER.forecast_comparison_fig(
+        x=dates, y_true=y_true,
+        models_pred=models_pred,
+        best_interval=best_interval,
+        target_label=f'{target_col} 深度学习', ylabel=_yunit(target_col),
+        save_path=save_path,
+    )
 
 
 def plot_metrics_comparison(results: dict, save_path: str):
-    """DL 模型指标对比柱状图。"""
+    """DL 模型 MAPE / R² 柱状对比."""
     models = list(results.keys())
-    mape_vals = [results[m]['MAPE'] for m in models]
-    r2_vals = [results[m]['R2'] for m in models]
-
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
-
-    colors = ['#E74C3C', '#3498DB', '#2ECC71', '#F39C12', '#9B59B6']
-    axes[0].bar(models, mape_vals, color=colors[:len(models)], alpha=0.8)
-    axes[0].set_title('MAPE(越低越好)', fontsize=12)
-    axes[0].set_ylabel('%')
-    for i, v in enumerate(mape_vals):
-        axes[0].text(i, v + 0.05, f'{v:.2f}%', ha='center', fontsize=10)
-
-    axes[1].bar(models, r2_vals, color=colors[:len(models)], alpha=0.8)
-    axes[1].set_title('R² 决定系数(越高越好)', fontsize=12)
-    axes[1].set_ylabel('R²')
-    for i, v in enumerate(r2_vals):
-        axes[1].text(i, v + 0.005, f'{v:.4f}', ha='center', fontsize=10)
-
-    plt.suptitle('公积金预测深度学习模型性能对比', fontsize=14)
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=120, bbox_inches='tight')
-    plt.close()
+    _PLOTTER.metrics_bars_fig(
+        groups={
+            'MAPE(越低越好)': (
+                models, [results[m]['MAPE'] for m in models], '{:.2%}'),
+            'R² 决定系数(越高越好)': (
+                models, [results[m]['R2'] for m in models], '{:.4f}'),
+        },
+        suptitle='公积金预测深度学习模型性能对比',
+        figsize=(13, 5),
+        save_path=save_path,
+    )
 
 
 def plot_training_curves(results: dict, save_path: str):
-    """训练/验证 loss 曲线(DL 专属,ML 版本没有)。"""
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-
-    colors = ['#E74C3C', '#3498DB', '#2ECC71', '#F39C12', '#9B59B6']
-
-    for i, (model_name, res) in enumerate(results.items()):
-        history = res['history']
-        color = colors[i % len(colors)]
-        axes[0].plot(history['train_loss'], color=color, label=model_name)
-        if history.get('val_loss'):
-            axes[1].plot(history['val_loss'], color=color, label=model_name)
-
-    axes[0].set_title('训练 Loss 曲线', fontsize=12)
-    axes[0].set_xlabel('Epoch')
-    axes[0].set_ylabel('MSE Loss')
-    axes[0].set_yscale('log')
-    axes[0].legend()
-    axes[0].grid(True, alpha=0.3)
-
-    axes[1].set_title('验证 Loss 曲线', fontsize=12)
-    axes[1].set_xlabel('Epoch')
-    axes[1].set_ylabel('MSE Loss')
-    axes[1].set_yscale('log')
-    axes[1].legend()
-    axes[1].grid(True, alpha=0.3)
-
-    plt.suptitle('深度学习模型训练过程', fontsize=14)
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=120, bbox_inches='tight')
-    plt.close()
+    """训练 / 验证 Loss 曲线 (1x2, log 轴, 多模型 overlay)."""
+    fig = _PLOTTER.training_curves_fig(
+        # results[model] 形如 {'history': {'train_loss': [...], 'val_loss': [...]}, ...}
+        results={name: res['history'] for name, res in results.items()},
+        log_scale=True,
+        ylabel='MSE Loss',
+        save_path=None,             # 先暂不保存, 加 suptitle 后再统一保存
+        close=False,
+    )
+    fig.suptitle('深度学习模型训练过程', fontsize=14)
+    fig.tight_layout()
+    _PLOTTER.save(fig, save_path)
+    plt.close(fig)
 
 
 def plot_policy_scenario(
@@ -376,23 +339,21 @@ def plot_policy_scenario(
     target_col: str,
     save_path: str,
 ):
-    """政策情景分析图。"""
+    """政策情景分析图 (基准 + 多情景虚线)."""
     fig, ax = plt.subplots(figsize=(12, 6))
-    ax.plot(dates, base_forecast[target_col].values, 'k-', linewidth=2,
-            label='基准预测(无政策调整)')
-
-    colors = ['#E74C3C', '#3498DB', '#2ECC71']
-    for i, (scenario_name, adjusted) in enumerate(policy_scenarios.items()):
-        ax.plot(dates, adjusted[target_col].values, '--',
-                color=colors[i % len(colors)], alpha=0.85, label=scenario_name)
-
-    ax.set_title(f'公积金 {target_col} 政策情景分析(DL 基准)', fontsize=13)
-    ax.set_ylabel('亿元 / 万人')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=120, bbox_inches='tight')
-    plt.close()
+    _PLOTTER.lines_compare(
+        ax,
+        x=dates,
+        baseline=base_forecast[target_col].values,
+        baseline_label='基准预测(无政策调整)',
+        series={name: adj[target_col].values
+                for name, adj in policy_scenarios.items()},
+        title=f'公积金 {target_col} 政策情景分析(DL 基准)',
+        ylabel=_yunit(target_col),
+    )
+    fig.tight_layout()
+    _PLOTTER.save(fig, save_path)
+    plt.close(fig)
 
 
 # ─── 5. 主流程 ────────────────────────────────────────────────────────────────
@@ -655,7 +616,7 @@ def main():
     logger.info(f'  测试集范围  : {test_dates[0].date()} ~ {test_dates[-1].date()}')
     logger.info(f'  参与对比模型: {list(results.keys())}')
     logger.info(f'  最优模型    : {best_name}')
-    logger.info(f'  最优 MAPE   : {results[best_name]["metrics"]["MAPE"]:.2f}%')
+    logger.info(f'  最优 MAPE   : {results[best_name]["metrics"]["MAPE"]:.2%}')
     logger.info(f'  最优 R2     : {results[best_name]["metrics"]["R2"]:.4f}')
     logger.info(f'\n  输出文件保存至: {output_dir}')
     logger.info('=' * 65)
