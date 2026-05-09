@@ -113,6 +113,15 @@ class BaseModel(ABC, nn.Module):
         # 结构: np.ndarray, shape (N,) 或 (N, output_size)
         # Populated by _fit_residuals() during training when probabilistic='residual'.
         self._residuals = None
+        # 残差来源标签 / Residual source label:
+        #   'val'      - 从验证集 OOS 残差拟合 (推荐, 区间反映真实泛化误差)
+        #   'train'    - 从训练集残差拟合 (易过度乐观, 已有 warning)
+        #   'cv'       - 从 K-fold 交叉验证残差拟合 (P1 增强)
+        #   None       - 尚未拟合
+        # 调用方 (含报表/监控) 可读这个字段判断区间是否可信
+        # / Track which split residuals were drawn from so monitoring/UI can
+        #   surface 'over-confident CI' warnings transparently.
+        self._residual_source: Optional[str] = None
     
     @abstractmethod
     def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
@@ -153,14 +162,42 @@ class BaseModel(ABC, nn.Module):
         mean = self.predict(test_data, **kwargs)
         return ProbabilisticPrediction(mean=mean)
 
-    def _fit_residuals(self, y_true: np.ndarray, y_pred: np.ndarray):
+    def _fit_residuals(
+        self,
+        y_true: np.ndarray,
+        y_pred: np.ndarray,
+        source: str = 'train',
+    ):
         """
-        计算并缓存训练残差 / Compute and cache training residuals.
+        计算并缓存残差 / Compute and cache residuals for residual-based CI.
 
-        残差 = 真实值 - 预测值，后续用于构建经验置信区间。
+        残差 = 真实值 - 预测值, 后续用于构建经验置信区间.
         Residuals = y_true - y_pred, later used to build empirical CIs.
+
+        Args:
+            y_true: 真值 (N,) 或 (N, M)
+            y_pred: 预测值, 形状同 y_true
+            source: 残差来源标签 ('val' | 'train' | 'cv'), 写入 self._residual_source
+                    供调用方 (报表/监控) 判断区间是否可信。
+
+        ⚠ **训练集残差 vs 验证集残差**:
+          XGBoost/RandomForest 等模型在训练集上常显著过拟合, 训练残差远小于
+          OOS 误差 → 区间会被严重低估 ("过度自信 CI"). 推荐传 source='val'
+          + 用验证集预测残差; 没有 val_data 时退化为 source='train' 并由调用方
+          打 warning. 见 ml_models.py BaseMLModel.fit 的实现.
+
+        ⚠ 多输出 (M > 1) 时, 保持 2D 形状 (N, M):
+          各列残差分布通常差异显著 (量纲/方差/偏度都可能不同),
+          后续 _get_residual_interval 会**按列**取分位数, 每个输出维度
+          得到独立的置信区间. 不要在调用前 .flatten() 把多维残差混在一起,
+          否则各维度区间被均化, 量纲小的维度区间会被高估.
+          Multi-output residuals are kept as (N, M) so that
+          _get_residual_interval can compute per-column quantiles.
         """
-        self._residuals = y_true - y_pred
+        # 保留维度信息 (N, M); 单输出时 numpy 广播仍然正确处理
+        # / Keep shape (N, M); single-output (M=1) still works via numpy broadcasting
+        self._residuals = np.asarray(y_true) - np.asarray(y_pred)
+        self._residual_source = source
 
     def _get_residual_interval(self, y_pred: np.ndarray) -> tuple:
         """
@@ -168,15 +205,17 @@ class BaseModel(ABC, nn.Module):
         from the empirical residual distribution.
 
         算法 / Algorithm:
-          1. 由 confidence_level（如 0.95）算出 alpha = 0.05
-          2. 取残差的 alpha/2 和 1-alpha/2 分位数
+          1. 由 confidence_level (如 0.95) 算出 alpha = 0.05
+          2. **按列**取残差的 alpha/2 和 1-alpha/2 分位数
+             (axis=0 → 每个输出维度得到独立的两个分位数)
           3. 将分位数加到点预测上得到 [lower, upper]
-          Step 1: Derive alpha from confidence_level (e.g. 0.95 -> 0.05).
-          Step 2: Get the alpha/2 and 1-alpha/2 percentiles of residuals.
+          Step 1: Derive alpha from confidence_level.
+          Step 2: Per-column percentiles (axis=0) of residuals.
           Step 3: Add these percentiles to the point prediction.
 
         Returns:
-            (lower, upper) 置信区间数组 / Confidence interval arrays.
+            (lower, upper) 置信区间数组, 与 y_pred 形状一致.
+            Confidence interval arrays matching y_pred shape.
         """
         if self._residuals is None:
             return y_pred, y_pred
@@ -187,12 +226,20 @@ class BaseModel(ABC, nn.Module):
         lower_percentile = (alpha / 2) * 100       # e.g. 2.5
         upper_percentile = (1 - alpha / 2) * 100   # e.g. 97.5
 
-        # 从训练残差分布取分位数 / Get quantiles from the training residual distribution
-        residual_lower = np.percentile(self._residuals, lower_percentile)
-        residual_upper = np.percentile(self._residuals, upper_percentile)
+        # 按 axis=0 (沿样本维) 取分位数; 多输出时对每列独立计算
+        # / Per-column percentile along sample axis; independent CI per output dim
+        residuals = self._residuals
+        if residuals.ndim == 1:
+            # 1D 残差: 全局分位数 (向后兼容), shape () 标量
+            residual_lower = np.percentile(residuals, lower_percentile)
+            residual_upper = np.percentile(residuals, upper_percentile)
+        else:
+            # 2D 残差 (N, M): 每列独立, 输出 shape (M,) 与 y_pred 末维匹配, 自动广播
+            residual_lower = np.percentile(residuals, lower_percentile, axis=0)
+            residual_upper = np.percentile(residuals, upper_percentile, axis=0)
 
-        # 残差为负 -> 模型高估 -> lower 向下偏移；反之 upper 向上偏移
-        # Negative residual = model over-predicted -> lower shifts down
+        # 残差为负 -> 模型高估 -> lower 向下偏移; 反之 upper 向上偏移
+        # / Negative residual = model over-predicted -> lower shifts down
         lower = y_pred + residual_lower
         upper = y_pred + residual_upper
 
@@ -228,7 +275,14 @@ class BaseModel(ABC, nn.Module):
         Args:
             load_path: 模型文件路径 / Path to the saved checkpoint file.
         """
-        checkpoint = torch.load(load_path, map_location=self.device)
+        # weights_only=False 必填: 我们 checkpoint 含 'config' dict (非张量),
+        # PyTorch 2.6+ 默认 weights_only=True 会拒绝加载. 由于本框架的 ckpt 来自
+        # 自己的 save_model (受信), 显式关闭安全检查.
+        # / weights_only=False is required: our ckpt contains a config dict;
+        #   PyTorch 2.6+ defaults to True and would refuse to load it.
+        checkpoint = torch.load(
+            load_path, map_location=self.device, weights_only=False,
+        )
         self.load_state_dict(checkpoint['model_state_dict'])
         self.config.update(checkpoint['config'])
         # 同步整个模块到 self.device,防止 submodule/buffer 滞留在 CPU

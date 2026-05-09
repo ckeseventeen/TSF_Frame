@@ -41,6 +41,7 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from typing import Any, Dict, List, Mapping, Optional
 import numpy as np
@@ -174,6 +175,17 @@ class ModelMonitor(BaseMonitor):
         # / Last retraining timestamp (drives time-based retrain rule)
         self._last_train_at: Optional[datetime] = self.created_at
 
+        # ── 健康度状态 ──────────────────────────────────────────────
+        # 持久化是否健康: store.insert_xxx 失败时置 False, check_status 时
+        # 上报到 MonitoringStatus.extra 让运维可见. 之前 try/except: pass
+        # 会让磁盘满 / 权限错被静默吞掉, 监控系统坏了用户都不知道.
+        # / Storage healthy flag; flipped to False on persistent backend errors
+        self._storage_healthy: bool = True
+        # 最近一次 store 错误信息, 用于诊断
+        self._last_storage_error: Optional[str] = None
+        # 模块内 logger, 用于上报库级别错误 (区别于 alert_manager 的业务告警)
+        self._logger = logging.getLogger(f'tsf_frame.monitoring.{model_id}')
+
     # ------------------------------------------------------------------
     # BaseMonitor 必须实现的抽象
     # ------------------------------------------------------------------
@@ -274,7 +286,8 @@ class ModelMonitor(BaseMonitor):
         prediction = float(prediction)
         actual_f = None if actual is None else float(actual)
 
-        # 1) 持久化
+        # 1) 持久化 — 失败不静默吞,记 logger.error + 翻 storage_healthy=False
+        # / Persist with error logging (no more silent except: pass)
         try:
             self.store.insert_prediction(
                 model_id=self.model_id, timestamp=timestamp,
@@ -282,8 +295,15 @@ class ModelMonitor(BaseMonitor):
                 y_pred=prediction, y_lower=y_lower, y_upper=y_upper,
                 y_actual=actual_f,
             )
-        except Exception:  # pragma: no cover
-            pass
+        except Exception as exc:
+            self._storage_healthy = False
+            self._last_storage_error = (
+                f'insert_prediction failed: {type(exc).__name__}: {exc}'
+            )
+            self._logger.error(
+                'ModelMonitor[%s] store.insert_prediction failed: %s',
+                self.model_id, exc, exc_info=True,
+            )
 
         # 2) 性能窗口 (按 target_ts 对齐)
         self.perf.update(
@@ -338,10 +358,10 @@ class ModelMonitor(BaseMonitor):
         """
         y_actual_f = float(y_actual)
 
-        # 1) 取本窗口里的 y_pred, 算残差用
-        rec = self.perf._records.get(target_ts)  # type: ignore[attr-defined]
+        # 1) 取本窗口里的 y_pred, 算残差用 (走公共接口, 不再触私有 _records)
+        rec = self.perf.get_record(target_ts)
         y_pred_for_residual: Optional[float] = (
-            rec.y_pred if rec is not None else None
+            rec['y_pred'] if rec is not None else None
         )
 
         # 2) 回填 perf 窗口
@@ -353,8 +373,15 @@ class ModelMonitor(BaseMonitor):
                 model_id=self.model_id, timestamp=target_ts,
                 target=self.target_name, y_actual=y_actual_f,
             )
-        except Exception:  # pragma: no cover
-            pass
+        except Exception as exc:
+            self._storage_healthy = False
+            self._last_storage_error = (
+                f'update_actual failed: {type(exc).__name__}: {exc}'
+            )
+            self._logger.error(
+                'ModelMonitor[%s] store.update_actual failed: %s',
+                self.model_id, exc, exc_info=True,
+            )
 
         # 4) 残差喂 concept_drift
         if y_pred_for_residual is not None:
@@ -408,10 +435,11 @@ class ModelMonitor(BaseMonitor):
         # history[-1] 不可靠 (可能是 settle_actual 事件或 h=12 的预测)。
         rule_violations: List[RuleViolation] = []
         if self.rule_engine is not None:
-            last_pred: Optional[float] = None
-            if self.perf._records:  # type: ignore[attr-defined]
-                last_target_ts = next(reversed(self.perf._records))  # type: ignore[attr-defined]
-                last_pred = self.perf._records[last_target_ts].y_pred  # type: ignore[attr-defined]
+            # 走 PerformanceMonitor 公共接口取最新一条 (h=1 视角); 不触私有字段
+            latest_rec = self.perf.get_latest_record()
+            last_pred: Optional[float] = (
+                latest_rec['y_pred'] if latest_rec is not None else None
+            )
             if last_pred is not None:
                 rule_violations = self.rule_engine.check(
                     prediction=[last_pred],
@@ -464,8 +492,15 @@ class ModelMonitor(BaseMonitor):
                          and not (isinstance(v, float) and np.isnan(v))},
                 window=self.perf.metric_window,
             )
-        except Exception:  # pragma: no cover
-            pass
+        except Exception as exc:
+            self._storage_healthy = False
+            self._last_storage_error = (
+                f'insert_metrics_snapshot failed: {type(exc).__name__}: {exc}'
+            )
+            self._logger.error(
+                'ModelMonitor[%s] store.insert_metrics_snapshot failed: %s',
+                self.model_id, exc, exc_info=True,
+            )
 
         # 分级告警
         if final_level == AlertLevel.CRITICAL:
@@ -502,7 +537,10 @@ class ModelMonitor(BaseMonitor):
                 'retraining_decision': {
                     'triggered': decision.triggered,
                     'reasons': decision.reasons,
+                    'errored_rules': list(decision.errored_rules),
                 },
+                'storage_healthy': self._storage_healthy,
+                'last_storage_error': self._last_storage_error,
             },
         )
 

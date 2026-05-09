@@ -110,13 +110,17 @@ def generate_hpf_data(years: int = 12, start_year: int = 2012) -> pd.DataFrame:
 def build_ml_features(
     data: pd.DataFrame,
     target_col: str,
-    seq_len: int,
     feature_config: dict,
 ) -> tuple:
     """
-    特征工程 + 滑动窗口，返回 (X, y, dates)。
+    特征工程, 返回 (X, y, dates, feature_cols).
+
     X 形状: (N, n_features)  ← 机器学习模型所需的 2D 输入
     y 形状: (N,)
+
+    注: 历史版本签名有 seq_len 参数, 但函数体从未使用 (滑动窗口逻辑在
+    build_dl_sequences 里). 已删除以避免 caller 误以为本函数会做滑窗.
+    / Removed dead seq_len parameter; sliding-window lives in build_dl_sequences.
     """
     # 特征工程
     engineer = create_feature_engineer(
@@ -379,7 +383,6 @@ def main():
 
     X, y, feat_dates, feature_cols = build_ml_features(
         processed_data, target_col,
-        seq_len=config.model.seq_len,
         feature_config=feature_cfg,
     )
     logger.info(f'  特征数量: {len(feature_cols)}')

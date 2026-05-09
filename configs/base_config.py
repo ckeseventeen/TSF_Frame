@@ -215,19 +215,37 @@ class BaseConfig:
             BaseConfig 实例 / BaseConfig instance
         """
         config = cls()
+        if config_dict is None:
+            # yaml.safe_load(空文件) 返回 None, 此处兜底返回默认配置.
+            # / Empty yaml → default config
+            return config
+        if not isinstance(config_dict, dict):
+            raise TypeError(
+                f'from_dict 期望 dict, 实际收到 {type(config_dict).__name__}; '
+                f'若 yaml 文件根节点不是 mapping, 请检查格式.'
+            )
 
-        # 遍历字典，将嵌套配置还原为对应的 dataclass 实例
-        # Iterate dict and reconstruct nested dataclass instances for sub-configs
+        # 嵌套子配置必须是 dict, 否则报错而不是静默用字符串覆盖 dataclass 实例
+        # / Sub-config keys must be dict; raise (not silently overwrite) on type mismatch
+        _NESTED = {
+            'dataset': DatasetConfig,
+            'training': TrainingConfig,
+            'model': ModelConfig,
+        }
         for key, value in config_dict.items():
-            if key == 'dataset' and isinstance(value, dict):
-                config.dataset = DatasetConfig(**value)
-            elif key == 'training' and isinstance(value, dict):
-                config.training = TrainingConfig(**value)
-            elif key == 'model' and isinstance(value, dict):
-                config.model = ModelConfig(**value)
+            if key in _NESTED:
+                if not isinstance(value, dict):
+                    raise TypeError(
+                        f"配置键 '{key}' 期望 dict (会构造 "
+                        f"{_NESTED[key].__name__}), 实际 "
+                        f"{type(value).__name__}={value!r}. "
+                        f'若想覆盖默认子配置, 请用嵌套 yaml 节点.'
+                    )
+                setattr(config, key, _NESTED[key](**value))
             elif hasattr(config, key):
                 setattr(config, key, value)
-        
+            # 未知键静默忽略 (向后兼容旧 yaml)
+
         return config
     
     @classmethod
@@ -243,9 +261,10 @@ class BaseConfig:
         """
         import yaml
         # 读取YAML文件并解析为字典 / Read YAML file and parse into dict
+        # 空文件时 yaml.safe_load 返回 None; from_dict 内部已兜底为默认配置.
         with open(yaml_path, 'r', encoding='utf-8') as f:
             config_dict = yaml.safe_load(f)
-        return cls.from_dict(config_dict)
+        return cls.from_dict(config_dict or {})
     
     def to_yaml(self, yaml_path: str):
         """

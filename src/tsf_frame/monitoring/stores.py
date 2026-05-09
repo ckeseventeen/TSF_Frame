@@ -83,6 +83,10 @@ class InMemoryStore(MetricStore):
         # 预测记录列表 (一条 = insert_prediction 一次)
         # / In-memory predictions table
         self._predictions: List[Dict[str, Any]] = []
+        # 索引: (model_id, target, timestamp) → 该记录在 _predictions 中的位置列表
+        # 用于把 update_actual 从 O(N) 全表扫降到 O(k), k = 同 key 记录数(通常 1).
+        # / Index for O(1) update_actual lookup
+        self._pred_index: Dict[tuple, List[int]] = {}
         # 指标快照列表 (扁平化为 {model_id, ts, name, value, window})
         # / Flattened metrics snapshot rows
         self._metrics: List[Dict[str, Any]] = []
@@ -100,24 +104,30 @@ class InMemoryStore(MetricStore):
         y_upper: Optional[float] = None, y_actual: Optional[float] = None,
     ) -> None:
         with self._lock:
-            self._predictions.append({
+            row = {
                 'model_id': model_id, 'timestamp': timestamp,
                 'target': target, 'y_pred': float(y_pred),
                 'y_lower': None if y_lower is None else float(y_lower),
                 'y_upper': None if y_upper is None else float(y_upper),
                 'y_actual': None if y_actual is None else float(y_actual),
-            })
+            }
+            idx = len(self._predictions)
+            self._predictions.append(row)
+            # 维护索引: 同 key 可能多条记录 (e.g. 同 target_ts 不同 horizon),
+            # 所以用 list 而非单值
+            key = (model_id, target, timestamp)
+            self._pred_index.setdefault(key, []).append(idx)
 
     def update_actual(
         self, *, model_id: str, timestamp: datetime, target: str,
         y_actual: float,
     ) -> None:
+        # O(k) 索引查找替代 O(N) 全表扫描; k 通常为 1 或 horizon 数 (≤12)
+        # / O(k) indexed lookup vs O(N) scan
         with self._lock:
-            for row in self._predictions:
-                if (row['model_id'] == model_id
-                        and row['target'] == target
-                        and row['timestamp'] == timestamp):
-                    row['y_actual'] = float(y_actual)
+            indices = self._pred_index.get((model_id, target, timestamp), [])
+            for idx in indices:
+                self._predictions[idx]['y_actual'] = float(y_actual)
 
     def insert_metrics_snapshot(
         self, *, model_id: str, timestamp: datetime,
@@ -309,11 +319,21 @@ class SQLiteStore(MetricStore):
         self, *, model_id: str, timestamp: datetime,
         metrics: Mapping[str, float], window: Optional[int] = None,
     ) -> None:
+        """
+        批量写入指标快照 / Batch insert metric rows.
+
+        显式事务边界: ``with conn:`` 上下文进入即开启 implicit transaction,
+        正常退出 commit, 异常时 rollback (sqlite3 标准行为). 这样多个
+        ``executemany`` 写入要么全成功要么全回滚, 防止断电/崩溃中途留下
+        部分数据.
+        / Explicit transaction: with-block commits on success, rolls back on error.
+        """
         rows = [
             (model_id, _iso(timestamp), name, float(value), window)
             for name, value in metrics.items()
         ]
         with self._connect() as conn:
+            # with conn 块即事务边界; 正常出 commit, 异常自动 rollback
             conn.executemany(
                 'INSERT INTO metrics_snapshot '
                 '(model_id, ts, name, value, window_size) '
@@ -429,9 +449,11 @@ class SQLiteStore(MetricStore):
             return out
 
     def cleanup_old(self, *, retain_days: int) -> int:
-        cutoff = _iso(datetime.now().fromtimestamp(
-            datetime.now().timestamp() - retain_days * 86400
-        ))
+        # 单次取 now, 避免毫秒级两次调用产生不一致;
+        # 用 datetime.fromtimestamp 类方法 (不是 instance.fromtimestamp, 那是反模式).
+        # / Single now() call; use classmethod fromtimestamp.
+        ts = datetime.now().timestamp() - retain_days * 86400
+        cutoff = _iso(datetime.fromtimestamp(ts))
         total = 0
         with self._connect() as conn:
             for tbl in ('predictions', 'metrics_snapshot', 'alerts'):
@@ -556,9 +578,35 @@ class JsonlStore(MetricStore):
         return out
 
     def query_predictions(self, *, model_id, start=None, end=None):
-        rows = [r for r in self._read_all(self._pred_file)
-                if r.get('model_id') == model_id
-                and 'y_actual_update' not in r]
+        """
+        查询预测 / Query predictions with async actual backfill applied.
+
+        JSONL 是追加式存储, ``update_actual`` 不能就地修改, 而是追加一条
+        ``y_actual_update`` 记录. 历史 bug: 之前 ``query_predictions`` 直接
+        过滤掉这些 update 记录, 导致回填的真值**永远不可见**.
+
+        修复: 用 last-write-wins 合并:
+        1. 顺序读所有行
+        2. 原始 prediction 行进入 (model_id, ts, target) → row 字典
+        3. 遇到 y_actual_update 行就用 ``y_actual`` 覆盖对应记录
+        / Merge update lines into base rows (last-write-wins).
+        """
+        all_rows = [r for r in self._read_all(self._pred_file)
+                    if r.get('model_id') == model_id]
+
+        merged: Dict[tuple, Dict[str, Any]] = {}
+        for r in all_rows:
+            key = (r.get('model_id'), r.get('ts'), r.get('target'))
+            if 'y_actual_update' in r:
+                # 回填记录: 仅用 y_actual_update 的值更新已有 prediction 的 y_actual
+                if key in merged:
+                    merged[key]['y_actual'] = float(r['y_actual_update'])
+                # 若对应 prediction 还没出现 (理论上不该发生, 防御性), 忽略
+            else:
+                # 原始 prediction 行: 后写覆盖前写 (last-write-wins)
+                merged[key] = dict(r)
+
+        rows = list(merged.values())
         return self._filter_time(rows, start, end)
 
     def query_metrics(self, *, model_id, start=None, end=None, name=None):

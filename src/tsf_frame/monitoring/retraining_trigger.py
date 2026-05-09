@@ -26,6 +26,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Mapping, Optional
@@ -81,15 +82,23 @@ time_based	Time	距上次训练 ≥ 30 天	时间驱动：定期刷新模型
 class RetrainingDecision:
     """重训决策 / Decision bundle."""
 
-    # 是否建议重训 (任一规则命中即 True)
-    # / Whether retraining is recommended
+    # 是否建议重训 (任一规则**业务命中**即 True; 谓词执行异常不会让此值变 True)
+    # / Whether retraining is recommended (only business hits, never errors)
     should_retrain: bool
     # 命中规则的人类可读原因列表
     # / Human-readable reasons (one per fired rule)
     reasons: List[str] = field(default_factory=list)
-    # 命中规则的 rule_id 列表
-    # / Fired rule ids
+    # 命中规则的 rule_id 列表 (谓词返回 True)
+    # / Fired rule ids (predicate returned True)
     triggered: List[str] = field(default_factory=list)
+    # 谓词执行抛异常的规则 ID 列表 (与 triggered 互斥, 不计入 should_retrain).
+    # 用途: 让运维区分 "规则真命中, 该重训" vs "规则代码出错, 别误判".
+    # / Rule ids whose predicate raised. NOT counted as a trigger;
+    #   surfaced separately so ops can tell business hits from code errors.
+    errored_rules: List[str] = field(default_factory=list)
+    # 谓词异常详情 {rule_id: 'ExcType: msg'}, 便于排查
+    # / Per-rule predicate error details for debugging
+    rule_errors: Dict[str, str] = field(default_factory=dict)
     # 冷却期结束时刻; 在此时刻之前 should_retrain 强制为 False
     # / End of cooldown window (if any)
     cooldown_until: Optional[datetime] = None
@@ -125,6 +134,7 @@ class RetrainingTrigger:
         rules: Optional[List[RetrainingRule]] = None,
         *,
         cooldown_hours: float = 0.0,
+        logger: Optional[logging.Logger] = None,
     ):
         # 规则列表; None 时使用 default_rules() 的 5 条通用规则
         # / Active rules; defaults to 5 generic rules
@@ -137,6 +147,11 @@ class RetrainingTrigger:
         # 最近一次记录到的重训时刻 (record_retraining 设置); 用于计算冷却剩余时长
         # / Timestamp of last recorded retraining
         self.last_retraining: Optional[datetime] = None
+        # 谓词异常的日志器; 默认走 'tsf_frame.monitoring.retraining' 命名空间
+        # / Logger for predicate-execution errors (separate from business hits)
+        self._logger = logger or logging.getLogger(
+            'tsf_frame.monitoring.retraining'
+        )
 
     # ---- 规则管理 -----------------------------------------------------
     def add(self, rule: RetrainingRule) -> None:
@@ -171,21 +186,39 @@ class RetrainingTrigger:
                     checked_at=ctx['now'],
                 )
 
-        triggered, reasons = [], []
+        # triggered: 业务命中 (谓词返回 True) — 才会让 should_retrain=True
+        # errored_rules: 谓词执行抛异常 — 单独存放, 不计入触发, 由运维侧排查
+        triggered: List[str] = []
+        reasons: List[str] = []
+        errored_rules: List[str] = []
+        rule_errors: Dict[str, str] = {}
         for r in self.rules:
             if not r.enabled:
                 continue
             try:
-                if bool(r.predicate(ctx)):
-                    triggered.append(r.rule_id)
-                    reasons.append(r.reason or r.rule_id)
+                hit = bool(r.predicate(ctx))
             except Exception as exc:
-                reasons.append(f'规则 {r.rule_id} 执行异常: {exc}')
+                # 谓词代码错误 ≠ 业务命中. 记录 + warning 日志, 不进 triggered.
+                err_msg = f'{type(exc).__name__}: {exc}'
+                errored_rules.append(r.rule_id)
+                rule_errors[r.rule_id] = err_msg
+                reasons.append(f'规则 {r.rule_id} 执行异常: {err_msg}')
+                self._logger.warning(
+                    'RetrainingTrigger rule %r predicate raised: %s',
+                    r.rule_id, exc, exc_info=True,
+                )
+                continue
+            if hit:
+                triggered.append(r.rule_id)
+                reasons.append(r.reason or r.rule_id)
 
         return RetrainingDecision(
+            # 关键: 仅由业务命中决定, 谓词异常不会误触发重训
             should_retrain=bool(triggered),
             reasons=reasons,
             triggered=triggered,
+            errored_rules=errored_rules,
+            rule_errors=rule_errors,
             cooldown_until=cooldown_until,
             checked_at=ctx['now'],
         )

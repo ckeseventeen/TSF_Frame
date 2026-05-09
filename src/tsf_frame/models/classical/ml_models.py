@@ -8,12 +8,15 @@ interface. Supports probabilistic prediction (residual-based CI),
 automatic multi-output wrapping, and feature importance extraction.
 """
 
+import logging
 import os
 import pickle
 import numpy as np
 import pandas as pd
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple
 from abc import ABC, abstractmethod
+
+_logger = logging.getLogger('tsf_frame.models.classical')
 
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.linear_model import LinearRegression, Ridge, Lasso
@@ -105,10 +108,13 @@ class BaseMLModel(BaseModel):
           4. 若 y 为多输出(shape[1] > 1),自动用 MultiOutputRegressor 包装
              Auto-wrap with MultiOutputRegressor for multi-output targets.
           5. 若 val_data 提供,用训练好的模型在验证集上计算 MSE
-          6. 若开启 probabilistic='residual',用训练集预测残差缓存到
-             self._residuals,供后续 _predict_probabilistic 构建置信区间。
-             When probabilistic='residual' is enabled, cache training
-             residuals into self._residuals for later CI construction.
+          6. 若开启 probabilistic='residual':
+             - **优先**用验证集 OOS 残差缓存到 self._residuals (source='val'),
+               这样区间反映真实泛化误差, 不被训练过拟合污染.
+             - 没有 val_data 时退化为训练集残差 (source='train') 并 warning.
+             When probabilistic='residual' is enabled, prefer **OOS validation
+             residuals** for self._residuals; fall back to training residuals
+             with a warning when val_data is absent.
 
         Args:
             train_data: (X_train, y_train) 元组,X 形状 (N, D),y 形状 (N,) 或 (N, M)
@@ -141,20 +147,45 @@ class BaseMLModel(BaseModel):
             self.model.fit(X_train, y_train, **kwargs)
 
         history = {'train_loss': []}
+        # val_data 同时被 val_loss 记录和 (新) 残差法 OOS 区间使用 — 提早算预测复用一次
+        # / Compute val prediction once: feeds both val_loss and OOS residual CI
+        y_val_pred: Optional[np.ndarray] = None
         if val_data is not None:
             X_val, y_val = val_data
-            y_pred = self.predict(X_val)
+            y_val_pred = self.predict(X_val)
             from tsf_frame.utils.metrics import MetricsCalculator
-            val_mse = MetricsCalculator.mse(y_val, y_pred)
+            val_mse = MetricsCalculator.mse(y_val, y_val_pred)
             history['val_loss'] = [val_mse]
 
-        # 残差法概率预测: 缓存训练集残差的经验分布,后续由
-        # BaseModel._get_residual_interval 取分位数构造置信区间
-        # Residual-based probabilistic prediction: cache training residual
-        # distribution for later quantile-based CI construction.
+        # 残差法概率预测: 优先用**验证集 OOS 残差**, 否则退化为训练集残差.
+        # 训练集残差对 XGBoost/RF 等过拟合模型会严重低估区间宽度 (CI 过窄, 过度自信);
+        # 验证集残差是 out-of-sample, 反映真实泛化误差, 区间更可信.
+        # 没有 val_data 时退化, 但**显式 warning** 让调用方知情, 并把残差来源标签
+        # ('train' vs 'val') 缓存到 self._residual_source 供监控/报表读.
+        # 注意: 保持残差 2D (N, M), 不要 flatten — 否则多输出场景各维度
+        # 量纲被混在一起, 区间会失真 (见 BaseModel._fit_residuals 文档).
+        # / Prefer OOS validation residuals; warn-and-fallback to training residuals.
         if self.probabilistic and self.probabilistic_method == 'residual':
-            y_train_pred = self.predict(X_train)
-            self._fit_residuals(y_train.flatten(), y_train_pred.flatten())
+            if y_val_pred is not None:
+                # 推荐路径: OOS 残差 → 区间反映真实泛化误差
+                # y_val 形状对齐: 与训练侧一致, 1D 时 reshape 到 (Nv, 1)
+                y_val_arr = np.asarray(val_data[1])
+                if y_val_arr.ndim == 1:
+                    y_val_arr = y_val_arr.reshape(-1, 1)
+                y_val_pred_2d = y_val_pred
+                if y_val_pred_2d.ndim == 1:
+                    y_val_pred_2d = y_val_pred_2d.reshape(-1, 1)
+                self._fit_residuals(y_val_arr, y_val_pred_2d, source='val')
+            else:
+                y_train_pred = self.predict(X_train)
+                self._fit_residuals(y_train, y_train_pred, source='train')
+                _logger.warning(
+                    "%s: 残差法置信区间在缺少 val_data 时退化为**训练集残差**, "
+                    "对易过拟合模型 (XGBoost/RF/GBM) 会显著低估区间宽度 "
+                    "(过度自信 CI). 强烈建议在 fit() 中传入 val_data 以获得 "
+                    "OOS 残差区间; 或改用 probabilistic_method='quantile'.",
+                    self.__class__.__name__,
+                )
 
         return history
 
@@ -252,46 +283,111 @@ class BaseMLModel(BaseModel):
         self.feature_names = checkpoint.get('feature_names')
         self.target_names = checkpoint.get('target_names')
 
-    def get_feature_importance(self) -> Optional[pd.DataFrame]:
+    def get_feature_importance(
+        self,
+        *,
+        per_horizon: bool = False,
+        aggregate: str = 'mean',
+    ) -> Optional[pd.DataFrame]:
         """
         获取特征重要性 DataFrame / Get feature importance as DataFrame.
 
-        多输出模型 (MultiOutputRegressor) 会被自动解包,取第 0 个子估计器的
-        重要性作为代表(假设各输出子模型结构一致)。
-        Tree-based 模型从 feature_importances_ 读取;线性模型从 |coef_| 读取;
-        若模型不支持任一种,返回 None。
-        For multi-output models, unwraps MultiOutputRegressor and uses the first
-        sub-estimator. Reads feature_importances_ for tree models, |coef_| for
-        linear models; returns None if neither is available.
+        Args:
+            per_horizon: 多输出模型 (MultiOutputRegressor) 时:
+                * False (默认): 跨所有 horizon 聚合, 返回单列 'importance'.
+                * True: 返回每个 horizon 一列 ('h1','h2',...) 加平均列 'mean'.
+            aggregate: 仅当 ``per_horizon=False`` 时生效, 跨子估计器聚合方式:
+                * 'mean' (默认): 各 horizon 取平均
+                * 'max':  各 horizon 取最大
+                * 'first': 仅取 estimators_[0] (向后兼容旧行为)
+
+        多输出模型: 此前仅取 ``estimators_[0]`` (h=1) 的重要性, 在
+        长期 horizon 表现差异显著时会失真. 现按 ``aggregate``聚合所有
+        子估计器, 默认 ``mean`` 给出全 horizon 视角. 设 ``per_horizon=True``
+        可对比"短期靠 lag, 长期靠季节"等差异.
+
+        Tree-based 模型 → feature_importances_; 线性模型 → |coef_|;
+        SVR(非线性核)/KNN 等返回 None.
 
         Returns:
-            按重要性降序排列的 DataFrame,列为 ['feature', 'importance'];
-            不支持的模型返回 None。
-            DataFrame sorted by importance (desc), or None if unsupported.
+            DataFrame.
+            * per_horizon=False: ['feature', 'importance'] 按 importance 降序;
+            * per_horizon=True : ['feature', 'h1', 'h2', ..., 'mean'] 按 mean 降序;
+            * 不支持的模型 / 没有任何子估计器暴露重要性 → None.
         """
-        # 解包 MultiOutputRegressor,访问底层单输出估计器
-        # Unwrap MultiOutputRegressor to access the underlying single-output estimator
-        model = self.model
-        if hasattr(model, 'estimators_') and isinstance(model.estimators_, list):
-            model = model.estimators_[0]
-
-        if hasattr(model, 'feature_importances_'):
-            # 树模型(RF/GBM/XGBoost/LightGBM/CatBoost/DT) 直接提供
-            # Tree-based models expose feature_importances_ directly.
-            importances = model.feature_importances_
-        elif hasattr(model, 'coef_'):
-            # 线性模型(Linear/Ridge/Lasso) 用系数绝对值作为重要性代理
-            # Linear models: use |coef_| as importance proxy.
-            importances = np.abs(model.coef_).flatten()
+        # 1) 收集 (子)估计器列表
+        outer = self.model
+        if (hasattr(outer, 'estimators_')
+                and isinstance(outer.estimators_, list)
+                and len(outer.estimators_) > 0):
+            sub_estimators = list(outer.estimators_)
+            is_multi = True
         else:
-            # SVR(非线性核)/KNN 等不暴露重要性 / SVR (non-linear)/KNN: unavailable
+            sub_estimators = [outer]
+            is_multi = False
+
+        # 2) 每个子估计器各自取 importance 向量
+        def _imp_of(est) -> Optional[np.ndarray]:
+            if hasattr(est, 'feature_importances_'):
+                return np.asarray(est.feature_importances_, dtype=float).ravel()
+            if hasattr(est, 'coef_'):
+                return np.abs(np.asarray(est.coef_, dtype=float)).ravel()
             return None
 
-        feature_names = self.feature_names or [f'feature_{i}' for i in range(len(importances))]
-        return pd.DataFrame({
-            'feature': feature_names[:len(importances)],
-            'importance': importances
-        }).sort_values('importance', ascending=False)
+        per_h_imps: List[np.ndarray] = []
+        for est in sub_estimators:
+            v = _imp_of(est)
+            if v is not None:
+                per_h_imps.append(v)
+        if not per_h_imps:
+            return None
+
+        # 长度对齐 (理论上同模型同特征下应一致, 但稳健起见)
+        n_feats = max(len(v) for v in per_h_imps)
+        per_h_imps = [
+            np.pad(v, (0, n_feats - len(v)), mode='constant')
+            if len(v) < n_feats else v
+            for v in per_h_imps
+        ]
+        # 形状: (n_horizons, n_features)
+        mat = np.vstack(per_h_imps)
+
+        feat_names = (
+            list(self.feature_names) if self.feature_names is not None
+            else [f'feature_{i}' for i in range(n_feats)]
+        )
+        if len(feat_names) < n_feats:
+            feat_names = feat_names + [
+                f'feature_{i}' for i in range(len(feat_names), n_feats)
+            ]
+        feat_names = feat_names[:n_feats]
+
+        # 3) per_horizon=True: 输出每个 horizon 一列
+        if per_horizon and is_multi:
+            cols: Dict[str, Any] = {'feature': feat_names}
+            for i in range(mat.shape[0]):
+                cols[f'h{i + 1}'] = mat[i]
+            cols['mean'] = mat.mean(axis=0)
+            return (pd.DataFrame(cols)
+                    .sort_values('mean', ascending=False)
+                    .reset_index(drop=True))
+
+        # 4) 单列 importance: 跨 horizon 聚合
+        if aggregate == 'mean' or not is_multi:
+            agg_vec = mat.mean(axis=0)
+        elif aggregate == 'max':
+            agg_vec = mat.max(axis=0)
+        elif aggregate == 'first':
+            agg_vec = mat[0]
+        else:
+            raise ValueError(
+                f"aggregate 必须是 'mean' | 'max' | 'first', got {aggregate!r}"
+            )
+
+        return (pd.DataFrame({
+            'feature': feat_names,
+            'importance': agg_vec,
+        }).sort_values('importance', ascending=False).reset_index(drop=True))
 
 
 class LinearRegressionModel(BaseMLModel):

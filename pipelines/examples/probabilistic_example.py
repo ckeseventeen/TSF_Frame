@@ -1,13 +1,21 @@
 import sys
 import os
 from pathlib import Path as _Path
+
+# sys.path 引导 + 项目根锚定 (CWD-independent)
 _HERE = _Path(__file__).resolve()
+_PROJECT_ROOT = _HERE.parent  # 兜底
 for _p in (_HERE.parent, *_HERE.parents):
     if (_p / 'configs').is_dir() and (_p / 'src').is_dir():
+        _PROJECT_ROOT = _p
         for _q in (_p, _p / 'src'):
             if str(_q) not in sys.path:
                 sys.path.insert(0, str(_q))
         break
+
+# 输出目录: <project_root>/logs/outputs/probabilistic
+# 保证从 IDE 直接 Run 也写到固定位置, 不在 CWD 留垃圾 PNG
+_OUT_DIR = _PROJECT_ROOT / 'logs' / 'outputs' / 'probabilistic'
 
 import numpy as np
 import pandas as pd
@@ -76,9 +84,12 @@ def plot_probabilistic_predictions(dates, y_true, pred_result, title):
     plt.grid(True, alpha=0.3)
     plt.xticks(rotation=45)
     plt.tight_layout()
-    plt.savefig(f'{title.replace(" ", "_")}.png', dpi=300, bbox_inches='tight')
+    # 输出锚定到项目根, 不依赖 CWD
+    _OUT_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = _OUT_DIR / f'{title.replace(" ", "_")}.png'
+    plt.savefig(out_path, dpi=300, bbox_inches='tight')
     plt.close()
-    print(f"  图表已保存: {title.replace(' ', '_')}.png")
+    print(f"  图表已保存: {out_path}")
 
 
 def test_ml_probabilistic():
@@ -132,7 +143,7 @@ def test_ml_probabilistic():
     mape = MetricsCalculator.mape(y_test, pred_result.mean)
     print(f"  MSE: {mse:.4f}")
     print(f"  MAE: {mae:.4f}")
-    print(f"  MAPE: {mape:.4f}%")
+    print(f"  MAPE: {mape:.2%}")
     
     print("\n7. 可视化结果...")
     plot_probabilistic_predictions(
@@ -213,7 +224,7 @@ def test_dl_probabilistic():
     mape = MetricsCalculator.mape(y_test, pred_result.mean)
     print(f"  MSE: {mse:.4f}")
     print(f"  MAE: {mae:.4f}")
-    print(f"  MAPE: {mape:.4f}%")
+    print(f"  MAPE: {mape:.2%}")
     
     print("\n7. 可视化结果...")
     plot_probabilistic_predictions(

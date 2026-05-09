@@ -133,8 +133,10 @@ class PredictionPlotter:
             list(palette) if palette is not None else list(DEFAULT_PALETTE)
         )
         # 是否在 save 后再 plt.show; 通常 CI / 批量产图设 False
-        # / Whether to call plt.show after save
-        self.show: bool = bool(apply_cn_fonts and show)  # show 默认就关
+        # / Whether to call plt.show after save (independent of apply_cn_fonts)
+        # 历史: 之前误写 `bool(apply_cn_fonts and show)`, 当 apply_cn_fonts=False
+        # 时即便 show=True 也会被强制关掉. 已修.
+        self.show: bool = bool(show)
         # 中文字体激活状态 (导入 base_visualizer 时已经写入 rcParams)
         # / CN fonts activated flag (informational)
         self.apply_cn_fonts: bool = apply_cn_fonts
@@ -487,15 +489,17 @@ class PredictionPlotter:
         # 下图: 最优模型 + 区间
         if best_interval is not None:
             best_pred, lo, hi = best_interval
-            best_name = (
-                next(iter(models_pred)) if not models_pred
-                else min(
+            # models_pred 为空时 next(iter(...)) 会 StopIteration; 用 'best' 兜底
+            # / Defensive against empty models_pred
+            if not models_pred:
+                best_name = 'best'
+            else:
+                best_name = min(
                     models_pred,
                     key=lambda k: float(np.mean(np.abs(
                         _to_array(models_pred[k]) - _to_array(y_true)
                     ))),
                 )
-            )
             self.interval_band(
                 axes[1],
                 x=x, y_pred=best_pred, y_lower=lo, y_upper=hi,

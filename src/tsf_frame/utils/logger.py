@@ -11,7 +11,7 @@ import os
 import sys
 import logging
 from datetime import datetime
-from typing import Optional
+from typing import Dict, Optional
 import colorlog
 
 
@@ -24,6 +24,9 @@ class LoggerManager:
     """
     _instance = None
     _loggers = {}
+    # 记录每个 logger 首次创建时的参数, 用于检测参数变化
+    # / Args used to first-create each logger; for change detection
+    _logger_args: Dict[str, tuple] = {}
 
     def __new__(cls):
         if cls._instance is None:
@@ -51,14 +54,24 @@ class LoggerManager:
 
         Returns:
             配置好的 logging.Logger 实例 / Configured logging.Logger instance
+
+        ⚠ 同名 logger 被第二次请求时, 若参数 (log_dir/level/console/file)
+        与首次不同, 会发出 RuntimeWarning 提示用户 — 单例缓存返回的仍是
+        **第一次的配置**. 想真正改配置请先 ``close_logger(name)`` 再重建.
         """
-        # B7 修复: 只依赖本管理器注册表 self._loggers 判重,不再额外检查
-        # logger.handlers。原先的 `if logger.handlers: return logger` 会误伤
-        # 外部(如 logging.basicConfig)已配置但本管理器未注册过的 logger,
-        # 导致该 logger 无法按本管理器的参数(level/console/file)重新配置。
-        # B7 fix: use only self._loggers as the idempotency source;
-        # don't skip configuration when external handlers exist.
+        # 当前调用的参数指纹 (用 None 表示日志目录默认)
+        current_args = (log_dir, level, console, file)
         if name in self._loggers:
+            # 命中缓存: 校验参数是否与首次创建一致
+            cached_args = self._logger_args.get(name)
+            if cached_args is not None and cached_args != current_args:
+                import warnings
+                warnings.warn(
+                    f"LoggerManager: logger '{name}' 已用参数 {cached_args} 创建过, "
+                    f"本次请求参数 {current_args} 被忽略 (返回缓存实例). "
+                    f"如需用新参数, 请先调 close_logger('{name}').",
+                    RuntimeWarning, stacklevel=3,
+                )
             return self._loggers[name]
 
         logger = logging.getLogger(name)
@@ -100,6 +113,7 @@ class LoggerManager:
             logger.addHandler(file_handler)
         
         self._loggers[name] = logger
+        self._logger_args[name] = current_args
         return logger
     
     def close_logger(self, name: str):
@@ -110,6 +124,8 @@ class LoggerManager:
                 handler.close()
                 logger.removeHandler(handler)
             del self._loggers[name]
+            # 同步清掉参数指纹, 这样下次 get_logger(name, ...) 不会误触发警告
+            self._logger_args.pop(name, None)
     
     def close_all(self):
         """关闭所有已注册的 logger / Close all registered loggers"""

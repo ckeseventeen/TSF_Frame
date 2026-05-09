@@ -25,8 +25,7 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 from abc import ABC, abstractmethod
-import warnings
-warnings.filterwarnings('ignore')
+# 注: 不再模块级 warnings.filterwarnings('ignore'); 见 public_datasets.py 同样说明.
 
 
 class BaseFeatureSelector(ABC):
@@ -49,10 +48,17 @@ class BaseFeatureSelector(ABC):
         """学习选择准则(得分/系数/排名等) / Fit selection criterion. Returns self."""
         pass
 
-    @abstractmethod
     def transform(self, X):
-        """按 selected_features 裁列,返回子集 DataFrame / Subset X by selected features."""
-        pass
+        """
+        按 selected_features 裁列, 返回子集 DataFrame.
+        / Subset X by selected features.
+
+        所有子类共用此实现 (历史上 6 个子类各自重复定义了一份相同的 transform,
+        已统一抽到基类). 若子类有特殊投影逻辑, 仍可 override.
+        """
+        if self.selected_features is None:
+            raise ValueError("Selector has not been fitted yet. Call 'fit' first.")
+        return X[self.selected_features]
 
     def fit_transform(self, X, y=None):
         """fit + transform 一步完成 / Convenience fit + transform."""
@@ -125,11 +131,6 @@ class KBestSelector(BaseFeatureSelector):
         scores = self.selector.scores_
         self.feature_importances = dict(zip(X.columns, scores))
         return self
-    
-    def transform(self, X):
-        if self.selected_features is None:
-            raise ValueError("Selector has not been fitted yet. Call 'fit' first.")
-        return X[self.selected_features]
 
 
 class RFESelector(BaseFeatureSelector):
@@ -147,11 +148,6 @@ class RFESelector(BaseFeatureSelector):
         self.selected_features = X.columns[mask].tolist()
         self.feature_importances = dict(zip(X.columns, self.selector.ranking_))
         return self
-    
-    def transform(self, X):
-        if self.selected_features is None:
-            raise ValueError("Selector has not been fitted yet. Call 'fit' first.")
-        return X[self.selected_features]
 
 
 class ModelBasedSelector(BaseFeatureSelector):
@@ -184,11 +180,6 @@ class ModelBasedSelector(BaseFeatureSelector):
         mask = importances >= thresh
         self.selected_features = X.columns[mask].tolist()
         return self
-    
-    def transform(self, X):
-        if self.selected_features is None:
-            raise ValueError("Selector has not been fitted yet. Call 'fit' first.")
-        return X[self.selected_features]
 
 
 class LassoSelector(BaseFeatureSelector):
@@ -206,11 +197,6 @@ class LassoSelector(BaseFeatureSelector):
         mask = coef > 0
         self.selected_features = X.columns[mask].tolist()
         return self
-    
-    def transform(self, X):
-        if self.selected_features is None:
-            raise ValueError("Selector has not been fitted yet. Call 'fit' first.")
-        return X[self.selected_features]
 
 
 class VarianceSelector(BaseFeatureSelector):
@@ -225,11 +211,6 @@ class VarianceSelector(BaseFeatureSelector):
         self.selected_features = X.columns[mask].tolist()
         self.feature_importances = variances.to_dict()
         return self
-    
-    def transform(self, X):
-        if self.selected_features is None:
-            raise ValueError("Selector has not been fitted yet. Call 'fit' first.")
-        return X[self.selected_features]
 
 
 class CorrelationSelector(BaseFeatureSelector):
@@ -245,11 +226,6 @@ class CorrelationSelector(BaseFeatureSelector):
         self.selected_features = [col for col in X.columns if col not in to_drop]
         self.feature_importances = {col: 1.0 for col in self.selected_features}
         return self
-    
-    def transform(self, X):
-        if self.selected_features is None:
-            raise ValueError("Selector has not been fitted yet. Call 'fit' first.")
-        return X[self.selected_features]
 
 
 class PCAReducer(BaseFeatureReducer):
@@ -317,45 +293,60 @@ class AutoFeatureEngineer:
         Lag / rolling 等特征工程器会在序列开头引入 NaN, 因此在
         engineer 阶段结束后会**自动 dropna 并同步 y 的索引**, 否则
         sklearn 的 selectors 会报 "Input contains NaN"。
+
+        注: 内部仅用于训练时学参数, 返回 self. 拿训练后输出请用 fit_transform.
+        / Internal use; call fit_transform() to get the transformed X.
         """
+        # 复用 fit_transform 内部产物, 把训练阶段产生的 X_out 缓存下来,
+        # 避免 fit_transform 调 fit() 再 transform() 时把每个 engineer
+        # 的 transform 跑两遍 (历史 bug, 浪费 ~50% CPU).
+        # / Cache the train-time output so fit_transform doesn't redo transform.
+        self._train_output = self._fit_pipeline(X, y)
+        self.pipeline = self.feature_engineers + self.selectors + self.reducers
+        return self
+
+    def _fit_pipeline(self, X, y=None):
+        """fit 各 engineer/selector/reducer 并**单次**计算训练阶段输出."""
         current_X = X.copy()
         current_y = y.copy() if y is not None else None
 
+        # 1) feature engineers: fit + transform 一步到位
         for engineer in self.feature_engineers:
             current_X = engineer.fit_transform(current_X)
 
-        # 关键: 特征工程后 dropna 并同步 y, 避免下游 selector 拿到 NaN
+        # 2) 特征工程后 dropna 并同步 y, 防 selector 收到 NaN
         if current_X.isna().any().any():
             valid_mask = ~current_X.isna().any(axis=1)
             current_X = current_X[valid_mask]
             if current_y is not None:
                 current_y = current_y.loc[current_X.index]
 
+        # 3) selectors / reducers
         for selector in self.selectors:
             current_X = selector.fit_transform(current_X, current_y)
-
         for reducer in self.reducers:
             current_X = reducer.fit_transform(current_X)
 
-        self.pipeline = self.feature_engineers + self.selectors + self.reducers
-        return self
+        return current_X
 
     def transform(self, X):
+        """对**新数据** (区别于训练数据) 应用已 fit 的流水线."""
         current_X = X.copy()
-        # 应用所有 engineers
         for engineer in self.feature_engineers:
             current_X = engineer.transform(current_X)
-        # engineer 后同样 dropna (与 fit 行为一致)
         if current_X.isna().any().any():
             current_X = current_X.dropna()
-        # 应用所有 selectors / reducers
         for step in (self.selectors + self.reducers):
             current_X = step.transform(current_X)
         return current_X
 
     def fit_transform(self, X, y=None):
+        """训练 + 返回训练阶段输出, 各 engineer 只跑一次 transform."""
         self.fit(X, y)
-        return self.transform(X)
+        # 直接返回 fit() 阶段已计算的训练输出, 不再二次 transform
+        # (此前 self.fit(X) 内部 fit_transform → 各 engineer transform,
+        #  接着 self.transform(X) 又重跑 transform, 等于双倍工作量)
+        return self._train_output
 
 
 SELECTOR_REGISTRY = {

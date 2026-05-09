@@ -122,7 +122,7 @@ def main():
     print(f"    MSE:  {mse:.4f}")
     print(f"    MAE:  {mae:.4f}")
     print(f"    RMSE: {rmse:.4f}")
-    print(f"    MAPE: {mape:.4f}%")
+    print(f"    MAPE: {mape:.2%}")
     
     print(f"\n  预测示例 (前5个):")
     for i in range(min(5, len(y_test_original))):

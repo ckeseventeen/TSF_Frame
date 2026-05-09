@@ -24,6 +24,7 @@
 
 from __future__ import annotations
 
+import itertools
 import math
 import warnings
 from collections import OrderedDict
@@ -287,6 +288,12 @@ class PerformanceMonitor:
         # / History of snapshots produced by snapshot()
         self.snapshots: List[Dict[str, Any]] = []
 
+        # 最近一次 current() 调用中, 哪些 metric 计算抛了异常 ({metric_name: str(exc)}).
+        # 此前混在返回 dict 里 (如 'mae__error') 会破坏 Dict[str, float] 类型契约,
+        # 现在单独存放. 调用方需要查问题时读它.
+        # / Per-metric error details from the latest current() call
+        self.last_errors: Dict[str, str] = {}
+
     # ------------------------------------------------------------------
     # 更新 / 查询
     # ------------------------------------------------------------------
@@ -383,6 +390,66 @@ class PerformanceMonitor:
         """列出已记录但 y_true 还未回填的 target_ts (按时间)。"""
         return [ts for ts, r in self._records.items() if r.y_true is None]
 
+    def get_record(
+        self, target_ts: datetime,
+    ) -> Optional[Dict[str, Optional[float]]]:
+        """
+        按 target_ts 取出单条预测记录的只读快照 / Public accessor.
+
+        外部调用者(例如 ModelMonitor)无需触碰 ``_records`` 私有字段,
+        通过本接口获得稳定 dict 视图: 字段命名与 ``_Record`` 对齐,
+        修改返回值不会影响内部存储。
+
+        Returns:
+            ``{'target_ts','y_pred','y_true','y_lower','y_upper'}`` 字典;
+            未找到该 target_ts 时返回 ``None``。
+        """
+        rec = self._records.get(target_ts)
+        if rec is None:
+            return None
+        return {
+            'target_ts': rec.target_ts,
+            'y_pred': rec.y_pred,
+            'y_true': rec.y_true,
+            'y_lower': rec.y_lower,
+            'y_upper': rec.y_upper,
+        }
+
+    def get_latest_record(
+        self,
+    ) -> Optional[Dict[str, Optional[float]]]:
+        """
+        取最新一条预测记录 (按插入序最末) / Latest record snapshot.
+
+        与 ``get_record`` 同样返回字段化 dict; 队列为空时返回 ``None``。
+        """
+        if not self._records:
+            return None
+        # OrderedDict: next(reversed(...)) 即最新插入的 key
+        latest_ts = next(reversed(self._records))
+        return self.get_record(latest_ts)
+
+    def iter_records(self):
+        """
+        惰性遍历所有记录 (按插入序) / Lazy iterator over records.
+
+        返回 ``(target_ts, dict)`` 二元组迭代器, 适合 MonitoringStatus
+        填充 / 报表等只读场景。
+        """
+        for ts, rec in self._records.items():
+            yield ts, {
+                'target_ts': rec.target_ts,
+                'y_pred': rec.y_pred,
+                'y_true': rec.y_true,
+                'y_lower': rec.y_lower,
+                'y_upper': rec.y_upper,
+            }
+
+    def n_settled(self) -> int:
+        """已回填真值的记录数 / Count of records with y_true filled."""
+        return sum(1 for r in self._records.values()
+                   if r.y_true is not None)
+
     def current(self, window: Optional[int] = None) -> Dict[str, float]:
         """
         计算指标 / Compute metrics over the latest ``window`` settled records.
@@ -392,20 +459,38 @@ class PerformanceMonitor:
                     取值会被 clamp 到 [1, window_size]。
 
         只用 ``y_true is not None`` 的记录, 按 target_ts 插入序取最近 N 条。
-        若全部未回填, 返回 NaN dict。
+
+        返回值约定 (类型严格 ``Dict[str, float]``):
+        - 全部未回填或异常计算失败 → 该 metric 值为 ``NaN``
+        - 计算异常细节通过 ``self.last_errors: Dict[str, str]`` 单独保存,
+          不再混入返回 dict (此前 ``f'{name}__error'`` 字符串混入是类型 bug)
+        - 调用方判断"无数据"用 ``np.isnan(v)``, 判断"算错了"看
+          ``self.last_errors``
+
+        / Returns strict Dict[str, float]; errors stored in self.last_errors.
         """
+        # 重置错误记录, 每次 current() 都是独立快照
+        self.last_errors: Dict[str, str] = {}
+
         n = int(window) if window is not None else self.metric_window
         n = max(1, min(n, self.window_size))
 
-        # 取最近 n 个 target_ts (按插入顺序的尾部)
-        recent_keys = list(self._records.keys())[-n:]
+        # 取最近 n 个 target_ts: 用 reversed + islice 避免 list(...) 创建全量列表.
+        # 先 reverse 拿尾部 n 个, 再 reverse 回升序便于按时间序聚合.
+        # / Use reversed+islice instead of list()[-n:] to avoid full-list materialization.
+        total = len(self._records)
+        if n >= total:
+            recent_iter = self._records.values()  # 等于全量, 直接用原序
+        else:
+            tail = list(itertools.islice(reversed(self._records.values()), n))
+            tail.reverse()
+            recent_iter = tail
 
         ys_true: List[float] = []
         ys_pred: List[float] = []
         ys_lo: List[Optional[float]] = []
         ys_hi: List[Optional[float]] = []
-        for k in recent_keys:
-            r = self._records[k]
+        for r in recent_iter:
             if r.y_true is None:
                 continue
             ys_true.append(r.y_true)
@@ -433,13 +518,14 @@ class PerformanceMonitor:
         for name in self.metric_names:
             try:
                 fn: MetricFn = get_metric_fn(name)
-                out[name] = fn(
+                out[name] = float(fn(
                     y_true_f, y_pred_f,
                     y_lower=lower_arr, y_upper=upper_arr,
-                )
+                ))
             except Exception as exc:
                 out[name] = float('nan')
-                out[f'{name}__error'] = str(exc)  # type: ignore[assignment]
+                # 错误细节单独存, 不污染返回 dict 的类型
+                self.last_errors[name] = str(exc)
         return out
 
     def set_metric_window(self, n: int) -> None:
@@ -715,11 +801,10 @@ class MultiHorizonMonitor:
         if not per_h:
             return {}
 
-        # 默认权重: 各 horizon settled 数量
+        # 默认权重: 各 horizon settled 数量 (走 PM 公共接口)
         if weights is None:
             counts = {
-                h: sum(1 for r in pm._records.values()
-                       if r.y_true is not None)
+                h: pm.n_settled()
                 for h, pm in self.per_horizon.items()
             }
             total = sum(counts.values())
@@ -764,8 +849,7 @@ class MultiHorizonMonitor:
             'per_horizon': per_h,
             'aggregated': agg,
             'n_settled_per_horizon': {
-                h: sum(1 for r in pm._records.values()
-                       if r.y_true is not None)
+                h: pm.n_settled()
                 for h, pm in self.per_horizon.items()
             },
         }
@@ -1029,8 +1113,7 @@ class MultiTargetMonitor:
             'metric_window': used_window,
             'per_target': per_t,
             'n_settled_per_target': {
-                t: sum(1 for r in pm._records.values()
-                       if r.y_true is not None)
+                t: pm.n_settled()
                 for t, pm in self.per_target.items()
             },
         }

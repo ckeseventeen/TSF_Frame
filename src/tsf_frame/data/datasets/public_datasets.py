@@ -11,8 +11,11 @@ import pandas as pd
 import numpy as np
 from typing import Dict, List, Optional, Tuple, Any
 from abc import ABC, abstractmethod
-import warnings
-warnings.filterwarnings('ignore')
+# 注: 不再用 `warnings.filterwarnings('ignore')` 模块级抑制 — 那会污染所有
+# 下游代码的警告输出, 严重影响 debug. 如需局部抑制, 请用 with 上下文:
+#     with warnings.catch_warnings():
+#         warnings.simplefilter('ignore')
+#         ...
 
 
 class BasePublicDataset(ABC):
@@ -76,7 +79,9 @@ class BasePublicDataset(ABC):
 class DartsDataset(BasePublicDataset):
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         super().__init__(config)
-        self.dataset_name = config.get('dataset_name', 'air_passengers')
+        # 通过 self.config 读取, super() 已把 None 兜底为 {}
+        # / Read via self.config (super() coerced None to {})
+        self.dataset_name = self.config.get('dataset_name', 'air_passengers')
     
     def load(self) -> pd.DataFrame:
         try:
@@ -153,8 +158,10 @@ class DartsDataset(BasePublicDataset):
             dates.append(current_date)
             current_date += timedelta(days=1)
         
-        np.random.seed(42)
-        values = np.random.randn(len(dates)).cumsum() + 100
+        # 用局部 RNG 实例, 不污染全局 np.random 状态
+        # / Local RNG to avoid polluting global state
+        rng = np.random.default_rng(42)
+        values = rng.standard_normal(len(dates)).cumsum() + 100
         
         self.data = pd.DataFrame({'value': values}, index=dates)
         
@@ -170,21 +177,29 @@ class DartsDataset(BasePublicDataset):
 class SyntheticDataset(BasePublicDataset):
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         super().__init__(config)
-        self.n_samples = config.get('n_samples', 1000)
-        self.seasonality_period = config.get('seasonality_period', 365)
-        self.trend_strength = config.get('trend_strength', 0.1)
-        self.noise_level = config.get('noise_level', 0.1)
-    
+        # 通过 self.config 读取, 防 config=None 时 .get() 炸
+        # / Read via self.config to safely handle config=None
+        self.n_samples = self.config.get('n_samples', 1000)
+        self.seasonality_period = self.config.get('seasonality_period', 365)
+        self.trend_strength = self.config.get('trend_strength', 0.1)
+        self.noise_level = self.config.get('noise_level', 0.1)
+        # 随机种子: 保证多次调用 load() 结果一致 (便于回归测试 / 复现实验)
+        # / RNG seed for reproducibility across load() calls
+        self.random_seed = int(self.config.get('random_seed', 42))
+
     def load(self) -> pd.DataFrame:
         from datetime import datetime, timedelta
-        
+
         start_date = datetime(2020, 1, 1)
         dates = [start_date + timedelta(days=i) for i in range(self.n_samples)]
-        
+
         t = np.arange(self.n_samples)
         trend = self.trend_strength * t
         seasonality = np.sin(2 * np.pi * t / self.seasonality_period)
-        noise = np.random.normal(0, self.noise_level, self.n_samples)
+        # 用独立 RNG 实例, 不污染全局 np.random 状态
+        # / Use a local Generator to avoid mutating the global RNG state
+        rng = np.random.default_rng(self.random_seed)
+        noise = rng.normal(0, self.noise_level, self.n_samples)
         
         values = 100 + trend + 10 * seasonality + noise
         
@@ -203,9 +218,10 @@ class SyntheticDataset(BasePublicDataset):
 class FinancialDataset(BasePublicDataset):
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         super().__init__(config)
-        self.ticker = config.get('ticker', 'AAPL')
-        self.start_date = config.get('start_date', '2010-01-01')
-        self.end_date = config.get('end_date', '2023-01-01')
+        # 通过 self.config 读取, 防 config=None 时 .get() 炸
+        self.ticker = self.config.get('ticker', 'AAPL')
+        self.start_date = self.config.get('start_date', '2010-01-01')
+        self.end_date = self.config.get('end_date', '2023-01-01')
     
     def load(self) -> pd.DataFrame:
         try:
@@ -248,19 +264,20 @@ class FinancialDataset(BasePublicDataset):
             dates.append(current_date)
             current_date += timedelta(days=1)
         
-        np.random.seed(42)
+        # 用局部 RNG, 防全局污染 / Local RNG
+        rng = np.random.default_rng(42)
         n_days = len(dates)
         base_price = 100
-        returns = np.random.normal(0.001, 0.02, n_days)
+        returns = rng.normal(0.001, 0.02, n_days)
         prices = base_price * (1 + returns).cumprod()
-        
+
         self.data = pd.DataFrame({
-            'Open': prices * (1 - np.random.uniform(0, 0.02, n_days)),
-            'High': prices * (1 + np.random.uniform(0, 0.03, n_days)),
-            'Low': prices * (1 - np.random.uniform(0, 0.03, n_days)),
+            'Open': prices * (1 - rng.uniform(0, 0.02, n_days)),
+            'High': prices * (1 + rng.uniform(0, 0.03, n_days)),
+            'Low': prices * (1 - rng.uniform(0, 0.03, n_days)),
             'Close': prices,
             'Adj Close': prices,
-            'Volume': np.random.randint(100000, 1000000, n_days)
+            'Volume': rng.integers(100000, 1000000, n_days),
         }, index=dates)
         
         self.metadata = {
@@ -276,8 +293,9 @@ class FinancialDataset(BasePublicDataset):
 class EnergyDataset(BasePublicDataset):
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         super().__init__(config)
-        self.data_type = config.get('data_type', 'electricity')
-        self.location = config.get('location', 'US')
+        # 通过 self.config 读取, 防 config=None 时 .get() 炸
+        self.data_type = self.config.get('data_type', 'electricity')
+        self.location = self.config.get('location', 'US')
     
     def load(self) -> pd.DataFrame:
         from datetime import datetime, timedelta
@@ -294,12 +312,15 @@ class EnergyDataset(BasePublicDataset):
         daily_pattern = 30 * np.sin(2 * np.pi * hour_of_day / 24)
         weekly_pattern = 20 * np.sin(2 * np.pi * day_of_week / 7)
         seasonal_pattern = 15 * np.sin(2 * np.pi * month_of_year / 12)
-        noise = np.random.normal(0, 5, n_hours)
-        
+        # 用局部 RNG, 防全局污染 / Local RNG
+        rng = np.random.default_rng(42)
+        noise = rng.normal(0, 5, n_hours)
+
         load = base_load + daily_pattern + weekly_pattern + seasonal_pattern + noise
         load = np.maximum(load, 20)
-        
-        temperature = 20 + 10 * np.sin(2 * np.pi * np.arange(n_hours) / 8760) + np.random.normal(0, 2, n_hours)
+
+        temperature = (20 + 10 * np.sin(2 * np.pi * np.arange(n_hours) / 8760)
+                       + rng.normal(0, 2, n_hours))
         
         self.data = pd.DataFrame({'load': load, 'temperature': temperature}, index=dates)
         

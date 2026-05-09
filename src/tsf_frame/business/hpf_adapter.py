@@ -15,6 +15,9 @@ import numpy as np
 from typing import Dict, Any, Tuple, List, Optional
 
 from .base_adapter import BaseBusinessAdapter
+# 全项目 MAPE 收口在 MetricsCalculator (eps 保护 + 小数形式),
+# 这里复用而不是重写, 避免三处 MAPE 计算逻辑分歧.
+from ..utils.metrics import MetricsCalculator
 
 
 class HPFAdapter(BaseBusinessAdapter):
@@ -71,28 +74,55 @@ get_policy_adjusted_forecast（政策模拟）
         # _scalers 结构 / _scalers structure:
         #   {col_name: {'type': 'minmax', 'min': float, 'max': float}}
         #   {col_name: {'type': 'zscore', 'mean': float, 'std': float}}
-        # 在 _normalize 中填充，供 _denormalize 使用 / Filled by _normalize, consumed by _denormalize
+        # 由 fit_preprocess() 学习, 由 transform_preprocess() 复用,
+        # 也用于 _denormalize() 反变换.
         self._scalers: Dict[str, Any] = {}
+        # 是否已通过 fit_preprocess 学过 scaler;
+        # transform_preprocess 必须在 _is_fitted=True 后调用, 否则报错
+        # / Whether fit_preprocess has been called
+        self._is_fitted: bool = False
 
     # ── 预处理 ───────────────────────────────────────────────────────────────
 
-    def preprocess(self, data: pd.DataFrame, **kwargs) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    def preprocess(
+        self, data: pd.DataFrame, fit: Optional[bool] = None, **kwargs,
+    ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
         """
-        公积金数据预处理 / HPF data preprocessing
+        公积金数据预处理 / HPF data preprocessing.
 
-        流程: [可选]异常值处理 → 归一化
-        Pipeline: [optional] outlier handling → normalization
+        流程: [可选]异常值处理 → 归一化.
+
+        🔴 防数据泄露 / Anti data-leakage:
+        - 训练集第一次调用: ``fit=True`` (或 ``fit=None`` 自动推断), 学习 scaler
+          (mu/sigma 或 min/max) 并缓存到 ``self._scalers``.
+        - 测试集调用: 必须 ``fit=False``, **复用训练集学到的 scaler**, 不能用
+          测试集自己的统计量.
 
         Args:
-            data: 原始公积金数据 / Raw HPF data
+            data: 原始数据.
+            fit:
+                - True  : 强制重新 fit scaler (覆盖之前的)
+                - False : 强制只 transform (要求已经 fit 过, 否则 RuntimeError)
+                - None  : 自动 — 第一次调用时 fit, 后续 transform-only
 
         Returns:
-            (处理后的数据, 元数据字典) / (Processed data, metadata dict)
-            元数据包含 scalers / outliers_info,供 postprocess 反变换。
-            Metadata contains scalers/outliers_info for postprocess inverse transform.
-        """
-        data = data.copy()
+            (处理后的数据, 元数据字典). metadata 包含 scalers / outliers_info,
+            供 postprocess 反变换.
 
+        Raises:
+            RuntimeError: ``fit=False`` 但 adapter 还没 fit 过.
+        """
+        # 决定是否 fit
+        if fit is None:
+            fit = not self._is_fitted   # 首次调用自动 fit, 之后 transform-only
+        if not fit and not self._is_fitted:
+            raise RuntimeError(
+                'preprocess(fit=False) 要求 adapter 已经 fit 过. '
+                '请先在训练集上调 preprocess(data, fit=True), '
+                '再在测试集上调 preprocess(data, fit=False).'
+            )
+
+        data = data.copy()
         metadata: Dict[str, Any] = {
             'original_columns': data.columns.tolist(),
             'normalization': self.normalization,
@@ -101,11 +131,38 @@ get_policy_adjusted_forecast（政策模拟）
         }
 
         if self.handle_outliers:
+            # 异常值处理只用当前数据自身的分布 (IQR / 3σ),
+            # 这是局部插值, 不会跨 train/test 泄露统计量.
             data, outliers_info = self._handle_outliers(data)
             metadata['outliers_info'] = outliers_info
 
-        data = self._normalize(data, metadata)
+        if fit:
+            # 训练阶段: 重新学 scaler 并保存
+            data = self._normalize(data, metadata)
+            self._is_fitted = True
+        else:
+            # 推理阶段: 复用 self._scalers, 不再重算统计量 (防数据泄露)
+            metadata['scalers'] = dict(self._scalers)
+            data = self._apply_scaler(data, self._scalers)
+
         return data, metadata
+
+    def _apply_scaler(
+        self, data: pd.DataFrame, scalers: Dict[str, Any],
+    ) -> pd.DataFrame:
+        """
+        用已 fit 的 scaler 做 transform-only 归一化 (不重算统计量).
+        / Transform-only normalization using a previously fitted scaler.
+        """
+        data = data.copy()
+        for col, sc in scalers.items():
+            if col not in data.columns:
+                continue
+            if sc['type'] == 'minmax':
+                data[col] = (data[col] - sc['min']) / (sc['max'] - sc['min'] + 1e-8)
+            elif sc['type'] == 'zscore':
+                data[col] = (data[col] - sc['mean']) / (sc['std'] + 1e-8)
+        return data
 
     def _handle_outliers(self, data: pd.DataFrame) -> Tuple[pd.DataFrame, Dict]:
         """
@@ -277,10 +334,15 @@ get_policy_adjusted_forecast（政策模拟）
             return False, f"以下列缺失率超过10%: {high_null.to_dict()}"
 
         # 4. 时间索引连续性检查（月度数据） / Time index continuity check (monthly data)
+        # 仅当能明确判定为"重复时间戳"时才阻断; pd.infer_freq 在数据头尾有 NaT、
+        # 或样本量过小时会误返 None, 不应据此一票否决. 严格频率检查交给
+        # monitoring.data_quality.FrequencyCheck (有 tolerance 字段) 做.
+        # / Only block on duplicate timestamps; defer strict frequency checking to
+        #   monitoring.FrequencyCheck (which supports tolerance).
         if isinstance(data.index, pd.DatetimeIndex) and len(data) > 1:
-            freq = pd.infer_freq(data.index)
-            if freq is None:
-                return False, "时间索引频率不规则，请检查是否有缺失月份"
+            if data.index.duplicated().any():
+                dup_count = int(data.index.duplicated().sum())
+                return False, f"时间索引存在 {dup_count} 个重复时间戳"
 
         return True, "数据验证通过"
 
@@ -315,11 +377,10 @@ get_policy_adjusted_forecast（政策模拟）
             true_vals = y_true[col].values.astype(float)
             pred_vals = y_pred[col].values.astype(float)
 
-            # MAPE（避免分母为 0）
-            mask = np.abs(true_vals) > 1e-8
-            if mask.any():
-                mape = np.mean(np.abs((true_vals[mask] - pred_vals[mask]) / true_vals[mask])) * 100
-                metrics[f'{col}_mape'] = float(mape)
+            # MAPE: 直接用 MetricsCalculator (eps 保护 + 小数形式),
+            # 避免本模块自己再写一份 mask/eps 逻辑造成三处 MAPE 不统一.
+            # / Delegate to MetricsCalculator for project-wide MAPE consistency.
+            metrics[f'{col}_mape'] = MetricsCalculator.mape(true_vals, pred_vals)
 
             # 趋势方向准确率（环比方向）
             if len(true_vals) > 1:
@@ -338,10 +399,11 @@ get_policy_adjusted_forecast（政策模拟）
                 pred_yoy = (pred_vals[12:] - pred_vals[:-12]) / (np.abs(pred_vals[:-12]) + 1e-8)
                 metrics[f'{col}_yoy_mae'] = float(np.mean(np.abs(true_yoy - pred_yoy)))
 
-            # 季度环比误差
+            # 季度环比误差: 与 yoy 对称 — 双方各自基于自己历史计算环比率
+            # / Quarter-over-quarter MAE: each side uses its OWN history as denominator
             if len(true_vals) > 3:
                 true_qoq = (true_vals[3:] - true_vals[:-3]) / (np.abs(true_vals[:-3]) + 1e-8)
-                pred_qoq = (pred_vals[3:] - pred_vals[:-3]) / (np.abs(true_vals[:-3]) + 1e-8)
+                pred_qoq = (pred_vals[3:] - pred_vals[:-3]) / (np.abs(pred_vals[:-3]) + 1e-8)
                 metrics[f'{col}_qoq_mae'] = float(np.mean(np.abs(true_qoq - pred_qoq)))
 
         return metrics

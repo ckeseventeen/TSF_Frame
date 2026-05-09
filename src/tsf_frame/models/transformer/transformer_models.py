@@ -89,18 +89,27 @@ def _dl_fit(model: 'BaseModel', train_data, val_data, config: dict) -> dict:
 
     history = {'train_loss': [], 'val_loss': []}
 
+    n_train = len(X_train)
     for epoch in range(epochs):
         model.train()
+        # total_loss 现在累计 "loss * batch_size" — 即未取平均的样本损失之和;
+        # 末轮按总样本数 n_train 取平均, 与 val_loss (一次性 forward 全部 X_val
+        # 走 MSELoss / PinballLoss 默认 reduction='mean') 真正同量纲.
+        # 旧实现 `total_loss += loss.item(); avg = total_loss / num_batches`
+        # 在 n_train % batch_size != 0 时, 尾批样本数偏小却被等权计入, 导致训练
+        # loss 估计有偏 (尾批权重虚高). 现改为样本加权平均.
+        # / Sample-weighted loss average: aligns with val_loss scale and removes
+        #   the tail-batch over-weighting bias.
         total_loss = 0.0
         # 打乱样本顺序,避免同一 mini-batch 里样本始终相邻带来的偏差
         # Shuffle sample order to remove position bias across epochs.
-        indices = torch.randperm(len(X_train))
-        num_batches = math.ceil(len(X_train) / batch_size)
+        indices = torch.randperm(n_train)
 
-        for i in range(0, len(X_train), batch_size):
+        for i in range(0, n_train, batch_size):
             batch_idx = indices[i: i + batch_size]
             batch_x = X_train[batch_idx]
             batch_y = y_train[batch_idx]
+            bsz = batch_x.size(0)
 
             model.optimizer.zero_grad()
             outputs = model(batch_x)
@@ -110,11 +119,12 @@ def _dl_fit(model: 'BaseModel', train_data, val_data, config: dict) -> dict:
             # Clip gradient L2 norm to prevent explosion (common in Transformer/RNN).
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             model.optimizer.step()
-            total_loss += loss.item()
+            # 关键: 乘 bsz 把"批均损失"还原成"样本损失之和"
+            total_loss += loss.item() * bsz
 
-        # 按 batch 数平均(而非样本数),保持与 val loss 量纲一致
-        # Average over batches (not samples) to match val loss scale.
-        avg_loss = total_loss / num_batches
+        # 按总样本数取平均, 与 val_loss (默认 reduction='mean') 同量纲
+        # / Per-sample average — matches val_loss scale
+        avg_loss = total_loss / n_train
         history['train_loss'].append(avg_loss)
 
         if val_data is not None:
@@ -278,6 +288,10 @@ class LSTMModel(_DLBaseModel):
         self.fc = nn.Linear(self.hidden_size, self.output_size)
 
         self.criterion = nn.MSELoss()
+        # 把所有参数搬到目标设备, 必须在 optimizer 创建之前
+        # 否则 optimizer 绑定的是 CPU 参数引用, 即使后续 .to(cuda) 也指不回来
+        # / Move params to device BEFORE optimizer; optimizer binds to tensor references.
+        self.to(self.device)
         self.optimizer = torch.optim.Adam(
             self.parameters(), lr=config.get('learning_rate', 0.001)
         )
@@ -319,6 +333,8 @@ class TransformerModel(_DLBaseModel):
         self.decoder = nn.Linear(self.d_model, self.output_size)
 
         self.criterion = nn.MSELoss()
+        # 把所有参数搬到目标设备, 必须在 optimizer 创建之前 (见 LSTMModel 注释)
+        self.to(self.device)
         self.optimizer = torch.optim.Adam(
             self.parameters(), lr=config.get('learning_rate', 0.001)
         )
@@ -334,21 +350,20 @@ class TransformerModel(_DLBaseModel):
         Returns:
             预测张量,形状 (batch_size, output_size),取最后一步的 hidden 过线性层。
             Output tensor of shape (B, C_out), decoded from the last time step.
+
+        Note (encoder-only, no causal mask):
+            本类是 *encoder-only* + 末位 pooling (取 ``x[:, -1, :]`` 过 decoder)。
+            历史窗口在 forward 入口已经全部可见, 编码器内部应该走 **双向自注意力**
+            充分混合上下文; 因此**不传** ``mask=causal_mask``:
+              * 输入窗口的全部时间步对模型来说都是已知历史, 不存在"未来泄漏"
+              * 加上三角 mask 后, 第 1 步看不到第 2..T 步, 削弱了表达能力,
+                间接污染末位 hidden state
+              * Causal mask 只在 *autoregressive decoder* 场景下需要 (本类不是)
         """
         x = self.pos_encoder(self.input_proj(x))
-
-        # 构造 causal mask 防止信息泄漏:上三角部分填充 -inf
-        # 显式构造可兼容 PyTorch < 1.13(后者 generate_square_subsequent_mask
-        # 不支持 device 参数),同时避免将来 API 行为变动。
-        # Build causal mask explicitly (upper triangle = -inf) for cross-version
-        # compatibility. Avoids reliance on generate_square_subsequent_mask
-        # whose `device` kwarg is only available in PyTorch >= 1.13.
-        T = x.size(1)
-        causal_mask = torch.triu(
-            torch.full((T, T), float('-inf'), device=x.device), diagonal=1
-        )
-        x = self.transformer_encoder(x, mask=causal_mask)
-
+        # 双向自注意力: 不传 mask, 让历史窗口的所有时间步互相可见
+        # / Bidirectional self-attention over the already-known history
+        x = self.transformer_encoder(x)
         return self.decoder(x[:, -1, :])
 
 
@@ -522,6 +537,8 @@ class Autoformer(_DLBaseModel):
         self.projection = nn.Linear(self.d_model, self.output_size)
 
         self.criterion = nn.MSELoss()
+        # 把所有参数搬到目标设备, 必须在 optimizer 创建之前 (见 LSTMModel 注释)
+        self.to(self.device)
         self.optimizer = torch.optim.Adam(
             self.parameters(), lr=config.get('learning_rate', 0.001)
         )
@@ -573,6 +590,8 @@ class iTransformer(_DLBaseModel):
         self.output_proj = nn.Linear(self.input_size * self.d_model, self.output_size)
 
         self.criterion = nn.MSELoss()
+        # 把所有参数搬到目标设备, 必须在 optimizer 创建之前 (见 LSTMModel 注释)
+        self.to(self.device)
         self.optimizer = torch.optim.Adam(
             self.parameters(), lr=config.get('learning_rate', 0.001)
         )
@@ -656,6 +675,8 @@ class TimesNet(_DLBaseModel):
         self.output_proj = nn.Linear(self.d_model, self.output_size)
 
         self.criterion = nn.MSELoss()
+        # 把所有参数搬到目标设备, 必须在 optimizer 创建之前 (见 LSTMModel 注释)
+        self.to(self.device)
         self.optimizer = torch.optim.Adam(
             self.parameters(), lr=config.get('learning_rate', 0.001)
         )
@@ -863,6 +884,21 @@ class DLinear(_DLBaseModel):
         self.output_size = config.get('output_size', 1)
         self.kernel_size = config.get('moving_avg_kernel', 25)
 
+        # Fail-fast: 当前实现是 channel-independent + 取第 0 个变量做目标,
+        # 多变量输入 (input_size > 1) 时会**静默丢弃**后 N-1 个变量的预测,
+        # 极易让用户排查"预测对不上"。明确拒绝, 而不是悄悄吞掉。
+        # 真要多目标? 请在外层用 MultiTargetMonitor 组合多个独立 DLinear 实例,
+        # 或者改 forward 返回 out.permute(0, 2, 1).reshape(B, -1) 走多输出路径
+        # (本类不在 P0 范围内做这件事).
+        # / Reject multi-variate input explicitly to prevent silent drop.
+        if self.input_size != 1:
+            raise ValueError(
+                f"DLinear 当前实现仅支持单变量输入 (input_size=1), "
+                f"传入 input_size={self.input_size} 会导致除第 0 个变量外的预测被静默丢弃. "
+                f"多目标场景请用 MultiTargetMonitor 组合多个 DLinear 实例, "
+                f"或改用支持多变量输出的模型 (LSTM/Transformer)."
+            )
+
         # 分位数配置 / Quantile config
         # 默认与 confidence_level=0.95 对应的 [0.025, 0.5, 0.975]
         default_quantiles = self._default_quantiles(
@@ -889,6 +925,8 @@ class DLinear(_DLBaseModel):
         else:
             self.criterion = nn.MSELoss()
 
+        # 把所有参数搬到目标设备, 必须在 optimizer 创建之前 (见 LSTMModel 注释)
+        self.to(self.device)
         self.optimizer = torch.optim.Adam(
             self.parameters(), lr=config.get('learning_rate', 0.001)
         )
@@ -919,10 +957,9 @@ class DLinear(_DLBaseModel):
 
         out = seasonal_out + trend_out                             # (B, N, out_dim)
 
-        # 取目标变量并截断到 out_dim / Take first variate up to out_dim
-        B = x.size(0)
-        out_dim = self.output_size * self.Q if self.use_quantile else self.output_size
-        return out.contiguous().view(B, -1)[:, :out_dim]          # (B, out_dim)
+        # __init__ 已经断言 input_size == 1, 这里 N=1, [:, 0, :] 等价取唯一变量
+        # / N==1 by __init__ guard; this slice picks the single variate
+        return out[:, 0, :].contiguous()                           # (B, out_dim)
 
     # fit 沿用 _DLBaseModel.fit (_dl_fit 训练循环)。
     # 分位数模式下 y_train 形状仍为 (N, output_size),PinballLoss 内部自动处理维度对齐。

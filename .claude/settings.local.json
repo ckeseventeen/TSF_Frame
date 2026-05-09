@@ -70,7 +70,10 @@
       "Bash(cd C:/Users/lzxso/Desktop/TSF_Frame && ls pipelines/examples/logs/ 2>&1 *)",
       "Bash(grep -E \"^logs$\")",
       "Bash(mv docs/HPF_PRODUCTION_BLUEPRINT.md docs/HPF生产部署蓝图.md)",
-      "Bash(rm docs/GUIDE.md docs/ARCHITECTURE.md docs/EXTENDING.md)"
+      "Bash(rm docs/GUIDE.md docs/ARCHITECTURE.md docs/EXTENDING.md)",
+      "Bash(python -m pytest tests/test_data_leakage.py -v --no-header)",
+      "Bash(python -m pytest -x -q)",
+      "Bash(python pipelines/examples/feature_engineering_example.py)"
     ]
   }
 }

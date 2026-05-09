@@ -142,8 +142,15 @@ class HPFConfig:
             'colsample_bytree': m.colsample_bytree,
         })
         # 深度学习参数（切换为 lstm/transformer 时生效）
+        # 注意: input_size 不在此处设置. DL 模型的 input_size 是**特征工程后的特征
+        # 维度**, 在配置阶段还不知道(取决于 lag/rolling/time 特征生成结果).
+        # caller 在调 get_dl_model 前必须基于 X_train.shape[-1] 显式设置:
+        #   dl_cfg = cfg.to_adapter_config()
+        #   dl_cfg['input_size'] = X_train.shape[-1]
+        #   model = get_dl_model('lstm', dl_cfg)
+        # 历史: 之前误设为 len(target_columns), 在 DL 路径会让 LSTM input_size=1
+        # / input_size omitted; caller MUST set after feature engineering
         cfg.update({
-            'input_size': len(self.data.target_columns),
             'hidden_size': m.hidden_size,
             'num_layers': m.num_layers,
             'dropout': m.dropout,

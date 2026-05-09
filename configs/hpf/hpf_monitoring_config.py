@@ -8,8 +8,21 @@
   - SQLite 作为默认持久化后端，无外部依赖
 """
 
+import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List, Any
+
+
+# 项目根目录: configs/hpf/hpf_monitoring_config.py → parents[2] → <root>
+# 不依赖 CWD, 让所有 example/cron/IDE 启动方式都能落到同一份 logs 下
+# / Project root anchor; CWD-independent
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _root_path(*parts: str) -> str:
+    """构造基于项目根的绝对路径 / Build abs path from project root."""
+    return str(_PROJECT_ROOT.joinpath(*parts))
 
 
 @dataclass
@@ -38,12 +51,14 @@ class HPFMonitoringConfig:
     outlier_sigma_ratio: float = 3.0
 
     # ── 业务指标告警阈值 ─────────────────────────────────────────────────
-    # MAPE(百分比形式，与 MetricsCalculator.mape 一致：已 *100)
-    mape_warning: float = 10.0
-    mape_critical: float = 15.0
-    # 方向准确率下限
+    # MAPE 阈值 (小数形式, 0.10 = 10%, 与 monitoring.mape / MetricsCalculator.mape 统一)
+    # 展示时用 f'{value:.2%}' 转百分比
+    # MAPE thresholds (decimal; 0.10 == 10%)
+    mape_warning: float = 0.10
+    mape_critical: float = 0.15
+    # 方向准确率下限 (小数, 0.60 = 60%)
     direction_accuracy_floor: float = 0.60
-    # YoY_MAE / mean(y_true) 阈值
+    # YoY_MAE / mean(y_true) 阈值 (小数)
     yoy_mae_ratio_warning: float = 0.20
 
     # ── 漂移阈值 ─────────────────────────────────────────────────────────
@@ -52,14 +67,21 @@ class HPFMonitoringConfig:
     ks_pvalue: float = 0.05
 
     # ── 持久化 ───────────────────────────────────────────────────────────
-    # 统一目录布局: ./logs/{runs,monitor,reports/hpf,outputs}
-    # SQLite 数据库路径（相对项目根目录）
-    sqlite_path: str = './logs/monitor/hpf_monitor.db'
+    # 统一目录布局: <project_root>/logs/{runs,monitor,reports/hpf,outputs}
+    # 默认值用 project_root 锚定的绝对路径, 防止从 IDE 直接 Run 文件时
+    # CWD = 文件所在目录, 导致日志写到 pipelines/examples/logs 这种"飞地".
+    # 用户 yaml 覆盖时仍可用相对/绝对路径自由控制.
+    # / Defaults are absolute (project-root anchored) to avoid CWD drift.
+
+    # SQLite 数据库路径
+    sqlite_path: str = field(default_factory=lambda: _root_path(
+        'logs', 'monitor', 'hpf_monitor.db'))
     # 历史保留月数；cleanup_old 按此裁剪
     retain_months: int = 36
 
     # ── 报表 ─────────────────────────────────────────────────────────────
-    report_dir: str = './logs/reports/hpf'
+    report_dir: str = field(default_factory=lambda: _root_path(
+        'logs', 'reports', 'hpf'))
     # 是否在 WARNING+ 时自动生成报表 PNG
     report_on_alert: bool = True
     report_dpi: int = 120
@@ -67,9 +89,11 @@ class HPFMonitoringConfig:
     # ── 告警通道 ─────────────────────────────────────────────────────────
     # 控制台 + 主日志由 get_logger 输出
     log_name: str = 'hpf_monitor'
-    log_dir: str = './logs/runs'
+    log_dir: str = field(default_factory=lambda: _root_path(
+        'logs', 'runs'))
     # 专用告警文件（仅 WARNING 以上）
-    alert_log_file: str = './logs/monitor/hpf_alerts.log'
+    alert_log_file: str = field(default_factory=lambda: _root_path(
+        'logs', 'monitor', 'hpf_alerts.log'))
 
     def to_dict(self) -> Dict[str, Any]:
         """序列化为字典（便于日志和调试）"""

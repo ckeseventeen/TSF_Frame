@@ -35,6 +35,19 @@ class BaseFeatureEngineer(ABC):
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         self.config = config or {}
         self.feature_names = []
+        # inplace=True 时, transform 直接修改输入 DataFrame, 跳过 .copy().
+        # 默认 False (安全), 性能敏感 / 长链 Composite 场景可手动开 True.
+        # 大数据集(百万级行) 关闭 copy 能省一半内存 + 一倍时间.
+        # / If True, transform mutates input (skip .copy()); default False for safety.
+        self.inplace: bool = bool(self.config.get('inplace', False))
+
+    def _maybe_copy(self, data: pd.DataFrame) -> pd.DataFrame:
+        """
+        内部 helper: 子类 transform 起手用此函数代替 ``data = data.copy()``.
+        ``self.inplace=False`` 时返回拷贝(默认), ``True`` 时直接返回原对象.
+        / Helper to centralize the copy-vs-inplace decision.
+        """
+        return data if self.inplace else data.copy()
 
     @abstractmethod
     def fit(self, data: pd.DataFrame) -> 'BaseFeatureEngineer':
@@ -76,8 +89,8 @@ class TimeFeatureEngineer(BaseFeatureEngineer):
         return self
     
     def transform(self, data: pd.DataFrame) -> pd.DataFrame:
-        data = data.copy()
-        
+        data = self._maybe_copy(data)
+
         if isinstance(data.index, pd.DatetimeIndex):
             idx = pd.Series(data.index, index=data.index)
         else:
@@ -141,7 +154,7 @@ class LagFeatureEngineer(BaseFeatureEngineer):
             追加滞后列的 DataFrame,列名格式 '{col}_lag_{k}'。
             前 max(lags) 行含 NaN。
         """
-        data = data.copy()
+        data = self._maybe_copy(data)
         new_features = []
 
         for col in self.target_cols:
@@ -181,9 +194,9 @@ class RollingFeatureEngineer(BaseFeatureEngineer):
         return self
     
     def transform(self, data: pd.DataFrame) -> pd.DataFrame:
-        data = data.copy()
+        data = self._maybe_copy(data)
         new_features = []
-        
+
         for col in self.target_cols:
             if col in data.columns:
                 for window in self.windows:
@@ -219,9 +232,9 @@ class ExpandingFeatureEngineer(BaseFeatureEngineer):
         return self
     
     def transform(self, data: pd.DataFrame) -> pd.DataFrame:
-        data = data.copy()
+        data = self._maybe_copy(data)
         new_features = []
-        
+
         for col in self.target_cols:
             if col in data.columns:
                 expanding = data[col].expanding()
@@ -266,9 +279,9 @@ class DifferenceFeatureEngineer(BaseFeatureEngineer):
         return self
     
     def transform(self, data: pd.DataFrame) -> pd.DataFrame:
-        data = data.copy()
+        data = self._maybe_copy(data)
         new_features = []
-        
+
         for col in self.target_cols:
             if col in data.columns:
                 for period in self.periods:
@@ -287,18 +300,30 @@ class CompositeFeatureEngineer(BaseFeatureEngineer):
         self.engineers = engineers
     
     def fit(self, data: pd.DataFrame) -> 'CompositeFeatureEngineer':
+        """
+        链式 fit: 每个 engineer 用前序 transform 后的结果做 fit.
+
+        历史上 fit 只是 ``for eng: eng.fit(data)`` (全用原始 data),
+        如果第二个 engineer 的 fit 依赖第一个 engineer 产生的列就会失败.
+        现在 fit 行为与 transform 一致: 链式传播中间结果.
+        / Chain fit so each engineer sees outputs of preceding engineers.
+        """
+        current = data.copy()
         for engineer in self.engineers:
-            engineer.fit(data)
+            engineer.fit(current)
+            current = engineer.transform(current)
         return self
-    
+
     def transform(self, data: pd.DataFrame) -> pd.DataFrame:
-        result = data.copy()
+        # Composite 顶层用 _maybe_copy: 各子 engineer 内部如果 inplace=True
+        # 还会再省一次拷贝 (链式串联时, 中间结果已经是新 DataFrame, 无需再拷贝)
+        result = self._maybe_copy(data)
         all_features = []
-        
+
         for engineer in self.engineers:
             result = engineer.transform(result)
             all_features.extend(engineer.get_feature_names())
-        
+
         self.feature_names = all_features
         return result
 

@@ -107,20 +107,44 @@ def rule_non_negative(
 def rule_sudden_change(
     *, prediction, last_actual: Optional[float] = None,
     max_ratio: float = 0.3, target: str = 'y',
-    severity: str = AlertLevel.WARNING, **_,
+    severity: str = AlertLevel.WARNING,
+    min_baseline: float = 1e-6,
+    skip_near_zero: bool = True, **_,
 ) -> List[RuleViolation]:
     """
     相比上一个实际值的环比变化 > max_ratio 即告警。
 
+    Args:
+        prediction:    本期预测序列 (取 ``arr[0]`` 与 last_actual 比)
+        last_actual:   上一期真值; ``None`` 时跳过本规则
+        max_ratio:     环比变化比率阈值 (默认 0.3)
+        target:        目标名 (写进 message / details)
+        severity:      告警级别 (默认 WARNING)
+        min_baseline:  ``|last_actual| < min_baseline`` 视为"接近 0",
+                       此时除法会数值放大噪声 → 默认跳过, 避免
+                       对零基线的"环比"误报 (如刚启动期、节假日断点).
+                       仍想检测? 设 ``skip_near_zero=False``, 此时
+                       ``|last_actual|`` 会被 clamp 到 ``min_baseline``,
+                       规则照常触发但分母不会爆.
+        skip_near_zero: ``True`` (默认) 时基线近 0 → 跳过本规则;
+                       ``False`` 时基线近 0 → 用 ``min_baseline`` clamp
+                       后照常算 (谁负责定义业务"小到可忽略"由调用方传入).
+
     (对月度数据常见业务约束)
     """
-    if last_actual is None or last_actual == 0:
+    if last_actual is None:
         return []
+    abs_base = abs(float(last_actual))
+    # 近 0 基线: 默认跳过 (避免误报); 显式关闭跳过则 clamp 到 min_baseline.
+    if abs_base < min_baseline:
+        if skip_near_zero:
+            return []
+        abs_base = min_baseline
     arr = np.atleast_1d(np.asarray(prediction, dtype=float))
     if arr.size == 0:
         return []
     first = float(arr[0])
-    ratio = abs(first - last_actual) / abs(last_actual)
+    ratio = abs(first - last_actual) / abs_base
     if ratio <= max_ratio:
         return []
     return [RuleViolation(
@@ -131,7 +155,9 @@ def rule_sudden_change(
                  f'(pred={first:.2f}, last={last_actual:.2f})'),
         value=ratio,
         details={'target': target, 'max_ratio': max_ratio,
-                 'pred': first, 'last_actual': last_actual},
+                 'pred': first, 'last_actual': last_actual,
+                 'min_baseline': min_baseline,
+                 'baseline_clamped': abs(float(last_actual)) < min_baseline},
     )]
 
 
@@ -274,11 +300,18 @@ class RuleEngine(RuleChecker):
                     message=f'规则 "{rid}" 未注册, 已跳过',
                 ))
                 continue
+            # context 里的键允许直接展开到规则函数 kwargs (如 'last_actual'),
+            # 但**不能覆盖** prediction / features / context 这三个保留参数,
+            # 否则 caller 传 context={'prediction': ...} 会篡改第 1 参数(安全 bug).
+            # / Don't let context override the reserved kwargs.
+            _RESERVED = ('prediction', 'features', 'context')
+            context_safe = {k: v for k, v in (context or {}).items()
+                            if k not in _RESERVED}
             kw: Dict[str, Any] = {
                 'prediction': prediction,
                 'features': features,
                 'context': context,
-                **context,          # 允许 context 键被规则直接接收
+                **context_safe,
                 **self.params.get(rid, {}),
             }
             # 只传函数能接收的参数

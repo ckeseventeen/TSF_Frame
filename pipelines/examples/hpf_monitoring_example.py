@@ -357,7 +357,6 @@ def main():
     processed, metadata = adapter.preprocess(raw)
     X, y, feat_dates, feat_cols = build_ml_features(
         processed, target_col,
-        seq_len=cfg.model.seq_len,
         feature_config=cfg.to_feature_config(),
     )
     logger.info(f'     features={len(feat_cols)}  samples={len(X)}')

@@ -5,6 +5,10 @@ from typing import Dict, Any, Optional, Tuple
 import numpy as np
 
 from ..base_model import BaseModel, ProbabilisticPrediction
+# 复用 transformer_models 的训练循环 + MC Dropout 推理, 避免重复造轮子.
+# 此前 MoiraiModel 自己写了一份 fit/_predict_probabilistic, 与 _dl_fit /
+# _mc_dropout_predict 几乎完全相同, 已重构为继承 _DLBaseModel.
+from ..transformer.transformer_models import _DLBaseModel
 
 
 class PatchEmbedding(nn.Module):
@@ -111,11 +115,19 @@ class MoiraiBlock(nn.Module):
         return x
 
 
-class MoiraiModel(BaseModel):
+class MoiraiModel(_DLBaseModel):
+    """
+    Salesforce Moirai 风格的零样本 / 通用时序基础模型.
+
+    继承 ``_DLBaseModel``: ``fit`` / ``predict`` / ``_predict_probabilistic``
+    全部走 transformer_models 的共享实现 (``_dl_fit`` / ``_dl_predict`` /
+    ``_mc_dropout_predict``), 子类只需实现 ``__init__`` 和 ``forward``.
+    """
+
     def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
         self.model_name = 'moirai'
-        
+
         self.input_size = config.get('input_size', 1)
         self.d_model = config.get('d_model', 512)
         self.nhead = config.get('nhead', 8)
@@ -124,134 +136,37 @@ class MoiraiModel(BaseModel):
         self.dropout = config.get('dropout', 0.1)
         self.patch_size = config.get('patch_size', 16)
         self.output_size = config.get('output_size', 1)
-        
+
         self.patch_embedding = PatchEmbedding(self.input_size, self.d_model, self.patch_size)
         self.rope = RotaryPositionalEmbedding(self.d_model)
-        
+
         self.blocks = nn.ModuleList([
             MoiraiBlock(self.d_model, self.nhead, self.dim_feedforward, self.dropout)
             for _ in range(self.num_layers)
         ])
-        
+
         self.norm = nn.LayerNorm(self.d_model)
         self.head = nn.Linear(self.d_model, self.output_size)
-        
+
         self.criterion = nn.MSELoss()
-        self.optimizer = torch.optim.AdamW(self.parameters(), lr=config.get('learning_rate', 0.0001))
-    
+        # 把所有参数搬到目标设备, 必须在 optimizer 创建之前 (与 transformer 系列一致)
+        self.to(self.device)
+        self.optimizer = torch.optim.AdamW(
+            self.parameters(), lr=config.get('learning_rate', 0.0001),
+        )
+
     def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
         x = self.patch_embedding(x)
         freqs = self.rope(x)
-        
         for block in self.blocks:
             x = block(x, freqs)
-        
         x = self.norm(x)
         x = x.mean(dim=1)
         x = self.head(x)
         return x
-    
-    def fit(self, train_data: Tuple[np.ndarray, np.ndarray], 
-            val_data: Optional[Tuple[np.ndarray, np.ndarray]] = None, **kwargs) -> Dict[str, Any]:
-        epochs = self.config.get('train_epochs', 100)
-        batch_size = self.config.get('batch_size', 32)
-        
-        X_train, y_train = train_data
-        X_train = torch.FloatTensor(X_train).to(self.device)
-        y_train = torch.FloatTensor(y_train).to(self.device)
-        
-        history = {'train_loss': [], 'val_loss': []}
-        
-        for epoch in range(epochs):
-            self.train()
-            total_loss = 0
-            
-            indices = torch.randperm(len(X_train))
-            for i in range(0, len(X_train), batch_size):
-                batch_idx = indices[i:i + batch_size]
-                batch_x = X_train[batch_idx]
-                batch_y = y_train[batch_idx]
-                
-                self.optimizer.zero_grad()
-                outputs = self(batch_x)
-                loss = self.criterion(outputs, batch_y)
-                loss.backward()
-                
-                torch.nn.utils.clip_grad_norm_(self.parameters(), 1.0)
-                self.optimizer.step()
-                
-                total_loss += loss.item()
-            
-            avg_train_loss = total_loss / (len(X_train) / batch_size)
-            history['train_loss'].append(avg_train_loss)
-            
-            if val_data is not None:
-                self.eval()
-                X_val, y_val = val_data
-                X_val = torch.FloatTensor(X_val).to(self.device)
-                y_val = torch.FloatTensor(y_val).to(self.device)
-                
-                with torch.no_grad():
-                    val_outputs = self(X_val)
-                    val_loss = self.criterion(val_outputs, y_val).item()
-                history['val_loss'].append(val_loss)
-                
-                print(f'Epoch {epoch+1}/{epochs}, Train Loss: {avg_train_loss:.4f}, Val Loss: {val_loss:.4f}')
-            else:
-                print(f'Epoch {epoch+1}/{epochs}, Train Loss: {avg_train_loss:.4f}')
-        
-        return history
-    
-    def predict(self, test_data: Any, **kwargs) -> np.ndarray:
-        self.eval()
-        if isinstance(test_data, tuple):
-            X_test, _ = test_data
-        else:
-            X_test = test_data
-        
-        X_test = torch.FloatTensor(X_test).to(self.device)
-        
-        with torch.no_grad():
-            predictions = self(X_test)
-        
-        return predictions.cpu().numpy()
-    
-    def _predict_probabilistic(self, test_data: Any, **kwargs) -> ProbabilisticPrediction:
-        if self.probabilistic_method == 'mc_dropout':
-            if isinstance(test_data, tuple):
-                X_test, _ = test_data
-            else:
-                X_test = test_data
-            
-            X_test = torch.FloatTensor(X_test).to(self.device)
-            
-            self.train()
-            predictions = []
-            
-            with torch.no_grad():
-                for _ in range(self.num_samples):
-                    pred = self(X_test)
-                    predictions.append(pred.cpu().numpy())
-            
-            predictions = np.array(predictions)
-            
-            mean = np.mean(predictions, axis=0)
-            std = np.std(predictions, axis=0)
-            
-            alpha = 1 - self.confidence_level
-            lower = np.percentile(predictions, (alpha / 2) * 100, axis=0)
-            upper = np.percentile(predictions, (1 - alpha / 2) * 100, axis=0)
-            
-            return ProbabilisticPrediction(
-                mean=mean,
-                lower=lower,
-                upper=upper,
-                std=std,
-                samples=predictions
-            )
-        
-        mean = self.predict(test_data, **kwargs)
-        return ProbabilisticPrediction(mean=mean)
+
+    # fit / predict / _predict_probabilistic 全部继承自 _DLBaseModel.
+    # / Inherited from _DLBaseModel.
 
 
 MOIRAI_REGISTRY = {

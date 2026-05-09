@@ -204,8 +204,8 @@ class DataDriftDetector(DriftDetector):
 
     def update(self, data: np.ndarray) -> None:
         arr = np.atleast_2d(np.asarray(data, dtype=float))
-        for row in arr:
-            self._buf.append(row)
+        # extend 一次性批量加入, 比 for+append 略快; 对 deque 行为等价
+        self._buf.extend(arr)
 
     def detect(self) -> DriftResult:
         if self.reference is None or len(self._buf) < 2:
@@ -319,9 +319,8 @@ class ConceptDriftDetector(DriftDetector):
     def update(self, data: np.ndarray) -> None:
         """``data`` 为残差 (y_true - y_pred) 的 1D 数组。"""
         arr = np.atleast_1d(np.asarray(data, dtype=float)).ravel()
-        for x in arr:
-            if not np.isnan(x):
-                self._buf.append(float(x))
+        # 先过滤 NaN, 再批量 extend (一次内存操作 vs 多次 append)
+        self._buf.extend(float(x) for x in arr if not np.isnan(x))
 
     def detect(self) -> DriftResult:
         if len(self._buf) < 5:
@@ -428,9 +427,8 @@ class PredictionDriftDetector(DriftDetector):
 
     def update(self, data: np.ndarray) -> None:
         arr = np.atleast_1d(np.asarray(data, dtype=float)).ravel()
-        for v in arr:
-            if not np.isnan(v):
-                self._buf.append(float(v))
+        # 批量 extend, 比 for+append 略快 (deque 行为等价)
+        self._buf.extend(float(v) for v in arr if not np.isnan(v))
 
     def detect(self) -> DriftResult:
         if self.reference is None or len(self._buf) < 2:
