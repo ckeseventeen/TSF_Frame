@@ -72,7 +72,7 @@ class HPFModelConfig:
     # XGBoost/LightGBM 推荐参数（适合月度中小数据集）
     n_estimators: int = 300
     max_depth: int = 4
-    learning_rate: float = 0.05
+    learning_rate: float = 0.01
     subsample: float = 0.8
     colsample_bytree: float = 0.8
     random_seed: int = 42

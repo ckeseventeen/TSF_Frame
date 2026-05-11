@@ -11,7 +11,15 @@
   7. 政策情景分析
 
 运行方式:
-    python examples/hpf_example.py
+    python pipelines/run_hpf_forecast.py
+
+附注 — DL 模型路径与 RevIN / DL model path & RevIN:
+  本 pipeline 当前只跑经典 ML 模型 (xgboost/lightgbm/ridge), 用差分目标 +
+  DiffTransform 解决外推. 如果以后扩展到 DL 模型 (LSTM/Transformer/...),
+  _DLBaseModel 已经把 RevIN 默认开 (config['use_revin'] 默认 True), 长趋势
+  HPF 数据上 5 个 Transformer 系列模型实测 test MAPE 从 6-20% 降到 ~0.5%.
+  扩展时**无需**手动在 model_config 里加 'use_revin': True — 已是默认行为.
+  显式关闭 RevIN: 在 model_config 里写 'use_revin': False.
 """
 
 import os
@@ -193,30 +201,29 @@ def train_and_evaluate(
     model = get_ml_model(model_name, model_config)
 
     if use_diff:
-        # 训练集差分：y_diff[i] = y[i+1] - y[i]，X 对齐到 y[i+1]
-        # 当期预测，用今天的特征预测今天的结果；X_train_fit = X_train[1:] 对齐到 y[i+1]
-        # Training-time differencing: y_diff[i] = y[i+1] - y[i], X aligned to y[i+1]
-        y_train_diff = np.diff(y_train)
-        X_train_fit = X_train[1:]
+        # 差分目标 + 累加还原: 通过 DiffTransform 统一封装
+        # / Diff target + cumsum reconstruction via DiffTransform.
+        # 等价于 ARIMA(.,1,.) 的 I 项, 解决树模型无法外推训练值域的问题.
+        from tsf_frame.utils.target_transforms import DiffTransform
+        tt = DiffTransform()
+        y_train_diff, X_train_fit = tt.transform(y_train, X_train)
         model.fit((X_train_fit, y_train_diff))
 
-        # 预测差分，再用测试集前的最后已知水平值累加还原
-        # anchor + cumsum(diff) 还原水平值序列
-        # Predict deltas, then reconstruct levels via anchor + cumsum(deltas)
+        # 预测差分, 再用测试集前的最后已知水平值累加还原
+        # / Predict deltas, then reconstruct levels via anchor + cumsum(deltas)
         y_pred_diff = model.predict(X_test).flatten()
         anchor = last_y_before_test if last_y_before_test is not None else y_train[-1]
-        y_pred = anchor + np.cumsum(y_pred_diff)
+        y_pred = tt.inverse_transform(y_pred_diff, anchor=anchor)
 
-        # 概率区间：同样在差分空间预测，累加还原上下界
-        # 注意: 累加后的区间宽度会随预测步数增长(不确定性累积),符合业务直觉
-        # Confidence intervals in diff-space are also cumsum-reconstructed;
-        # interval width grows with horizon (cumulative uncertainty).
+        # 概率区间: 同样在差分空间预测, 累加还原上下界
+        # 累加后的区间宽度会随预测步数增长 (不确定性累积), 符合业务直觉
+        # / CIs in diff-space are also cumsum-reconstructed; width grows with horizon.
         prob_diff = model.predict_probabilistic(X_test)
         if prob_diff.lower is not None:
             prob_result = ProbabilisticPrediction(
                 mean=y_pred,
-                lower=anchor + np.cumsum(prob_diff.lower.flatten()),
-                upper=anchor + np.cumsum(prob_diff.upper.flatten()),
+                lower=tt.inverse_transform(prob_diff.lower.flatten(), anchor=anchor),
+                upper=tt.inverse_transform(prob_diff.upper.flatten(), anchor=anchor),
             )
         else:
             prob_result = ProbabilisticPrediction(mean=y_pred)

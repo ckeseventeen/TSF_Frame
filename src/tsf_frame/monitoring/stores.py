@@ -195,6 +195,13 @@ class InMemoryStore(MetricStore):
                 r for r in self._predictions
                 if r['timestamp'].timestamp() >= cutoff
             ]
+            # 重建位置索引: cleanup 后旧 _pred_index 中的 int 位置已全部失效,
+            # 直接用旧索引会导致 update_actual 修改错误行.
+            # / Rebuild position index: old int positions are stale after filtering.
+            self._pred_index.clear()
+            for idx, row in enumerate(self._predictions):
+                key = (row['model_id'], row['target'], row['timestamp'])
+                self._pred_index.setdefault(key, []).append(idx)
             self._metrics = [
                 r for r in self._metrics
                 if r['timestamp'].timestamp() >= cutoff

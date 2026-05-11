@@ -49,7 +49,7 @@ from tsf_frame.visualization import PredictionPlotter
 
 from configs.hpf.hpf_config import HPFConfig
 from tsf_frame.business.hpf_adapter import HPFAdapter
-from tsf_frame.features.engineering import create_feature_engineer
+from tsf_frame.features.mixed_feature_handler import MixedFeatureHandler
 from tsf_frame.utils.metrics import MetricsCalculator
 from tsf_frame.utils.logger import get_logger
 from tsf_frame.models.transformer.transformer_models import get_dl_model
@@ -60,7 +60,7 @@ from tsf_frame.models.base_model import ProbabilisticPrediction
 # 与 hpf_example.py 完全一致,确保两个示例可直接对比
 # Identical to hpf_example.py so both examples can be compared directly.
 
-def generate_hpf_data(years: int = 200, start_year: int = 2012) -> pd.DataFrame:
+def generate_hpf_data(years: int = 50, start_year: int = 2012) -> pd.DataFrame:
     """
     生成模拟月度公积金数据,包含:
       - 长期增长趋势(政策驱动)
@@ -121,58 +121,9 @@ def generate_hpf_data(years: int = 200, start_year: int = 2012) -> pd.DataFrame:
     return data
 
 
-# ─── 2. 特征工程 ──────────────────────────────────────────────────────────────
-
-def build_ml_features(
-    data: pd.DataFrame,
-    target_col: str,
-    feature_config: dict,
-) -> tuple:
-    """
-    特征工程,返回 (X_2d, y, dates, feature_cols)。
-    Feature engineering returns 2D matrix; 3D reshape is done in build_dl_sequences.
-
-    X_2d 形状: (N, n_features)
-    y    形状: (N,)
-    """
-    engineer = create_feature_engineer(
-        feature_types=['time', 'lag', 'rolling', 'difference'],
-        config=feature_config,
-    )
-    df_feat = engineer.fit_transform(data)
-    df_feat = df_feat.dropna()
-
-    feature_cols = [c for c in df_feat.columns if c != target_col]
-    X = df_feat[feature_cols].values.astype(np.float32)
-    y = df_feat[target_col].values.astype(np.float32)
-    dates = df_feat.index
-
-    return X, y, dates, feature_cols
-
-
-def build_dl_sequences(
-    X: np.ndarray, y: np.ndarray, seq_len: int
-) -> tuple:
-    """
-    将 2D 特征矩阵 (N, F) 转为 3D 序列 (N', seq_len, F) 供 DL 模型使用。
-    Convert 2D feature matrix (N, F) into 3D sequences (N', seq_len, F) for DL models.
-
-    每条样本: 用前 seq_len 步的特征预测第 seq_len 步的目标。
-    Each sample: use past seq_len feature steps to predict target at step seq_len.
-
-    Returns:
-        X_seq: (N - seq_len, seq_len, F)
-        y_seq: (N - seq_len, 1)
-    """
-    X_seq, y_seq = [], []
-    for i in range(seq_len, len(X)):
-        X_seq.append(X[i - seq_len: i])
-        y_seq.append(y[i])
-    X_seq = np.asarray(X_seq, dtype=np.float32)
-    # 目标 reshape 为 (N, 1) 以匹配 DL 模型的 output_size=1
-    # Reshape y to (N, 1) to match DL model output_size=1
-    y_seq = np.asarray(y_seq, dtype=np.float32).reshape(-1, 1)
-    return X_seq, y_seq
+# ─── 2. 数据处理与转换 ──────────────────────────────────────────────────────────
+# 深度学习模型直接使用原始多元时间序列构建滑动窗口，无需手动构建 lag / diff 等传统特征
+# DL models directly use raw multivariate time series for sliding windows.
 
 
 # ─── 3. DL 模型训练与评估 ─────────────────────────────────────────────────────
@@ -187,55 +138,86 @@ def train_and_evaluate_dl(
     metadata: dict,
     logger,
     target_col: str,
+    use_diff: bool = False,
 ) -> dict:
     """
     训练单个深度学习模型并返回评估结果 / Train a single DL model and return evaluation.
 
     流程 / Pipeline:
-      1. get_dl_model 工厂函数创建模型(自动 to(device))
-         Create model via factory and move to device.
-      2. model.fit((X_train, y_train), (X_val, y_val))
-         训练(内部循环 epoch,梯度裁剪 1.0,按 batch 平均 loss)
-         Training loop with gradient clipping and batch-averaged loss.
-      3. model.predict(X_test) 点预测 / Point prediction.
-      4. model.predict_probabilistic(X_test) MC Dropout 分位数区间
-         MC Dropout quantile-based confidence intervals.
-      5. 反归一化 → MetricsCalculator.calculate_all(MAE/MAPE/R2/...)
-         Denormalize and compute metrics.
+      1. (可选) DiffTransform 把 y 变成一阶差分, X 同步对齐 [1:]
+      2. get_dl_model 工厂函数创建模型(自动 to(device))
+      3. model.fit((X_train, y_train), (X_val, y_val))
+      4. model.predict(X_test) 点预测 (差分空间) → inverse_transform 累加还原
+      5. model.predict_probabilistic(X_test) MC Dropout 区间 → 同样累加还原
+      6. 反归一化 → MetricsCalculator.calculate_all(MAE/MAPE/R2/...)
 
     Args:
-        model_name:  'lstm' / 'transformer' / 'autoformer' / 'itransformer' / 'timesnet'
-        model_config: DL 模型配置字典(已注入 input_size/device/probabilistic 等)
-        X_*_seq:     3D 序列张量 (N, seq_len, F) / 3D input tensors
-        y_*_seq:     (N, 1) 目标序列 / Target sequences (N, 1)
-        adapter:     HPFAdapter 实例,用于反归一化 / For denormalization
-        metadata:    预处理元数据 / Preprocessing metadata
-        target_col:  目标列名 / Target column name
+        model_name:  'lstm' / 'transformer' / 'autoformer' / 'itransformer' /
+                     'timesnet' / 'dlinear'
+        model_config: DL 模型配置字典
+        X_*_seq:     3D 序列张量 (N, seq_len, F)
+        y_*_seq:     (N, 1) 目标序列
+        adapter:     HPFAdapter, 用于反归一化
+        metadata:    预处理元数据
+        target_col:  目标列名
+        use_diff:    True 时把目标改为 y_diff[i]=y[i]-y[i-1] 训练, 推理后累加还原.
+                     anchor 自动取 y_val_seq[-1] (归一化空间下最贴近测试集的真值).
+                     适用: LSTM/Transformer/Autoformer/iTransformer/TimesNet 这些
+                     **无外推能力**的 DL 模型 — 它们的 LayerNorm + softmax + 末位
+                     Linear 都是反外推机制, 长趋势数据测试集外推时必崩.
+                     不适用: DLinear (自带 SeriesDecomp 趋势外推, 叠加 diff 反而
+                     破坏架构归纳偏置).
+                     / Differencing target so non-extrapolating DL models work
+                       on data with strong trend (HPF deposit/loan_balance).
 
     Returns:
-        dict: {'model', 'y_pred', 'prob_result', 'metrics'}
+        dict: {'model', 'y_pred', 'prob_result', 'metrics', 'history'}
+              y_pred / prob_result 都已经在**原 (归一化) 水平值空间**, 即
+              已经做过 inverse_transform; 下游反归一化继续走 _denormalize.
     """
-    logger.info(f'  Training {model_name}...')
+    from tsf_frame.utils.target_transforms import DiffTransform
+
+    tag = '（差分目标）' if use_diff else ''
+    logger.info(f'  Training {model_name}{tag}...')
+
+    # ── 训练侧: 可选差分 ──────────────────────────────────────────────────
+    if use_diff:
+        tt = DiffTransform()
+        # transform 同时对齐 X (差分后 y 少 1 行, X 也 [1:])
+        y_train_t, X_train_t = tt.transform(y_train_seq, X_train_seq)
+        y_val_t,   X_val_t   = tt.transform(y_val_seq,   X_val_seq)
+        # anchor: 测试集开始前最后一个真实水平 (归一化空间)
+        # 用 y_val_seq[-1] 比 y_train_seq[-1] 更紧邻测试集, 误差更小.
+        anchor = float(y_val_seq.flatten()[-1])
+    else:
+        tt = None
+        X_train_t, y_train_t = X_train_seq, y_train_seq
+        X_val_t,   y_val_t   = X_val_seq,   y_val_seq
+        anchor = None
 
     model = get_dl_model(model_name, model_config)
-    # DL 模型需要显式 to(device),BaseModel 构造器只缓存 device 字符串
-    # DL models need explicit .to(device); BaseModel only stores the string
     model = model.to(model_config['device'])
 
-    # 训练(带验证集监控)
-    # Train with validation monitoring
-    history = model.fit((X_train_seq, y_train_seq), (X_val_seq, y_val_seq))
+    history = model.fit((X_train_t, y_train_t), (X_val_t, y_val_t))
 
-    # 点预测(eval 模式,Dropout 关闭)
-    # Point prediction in eval mode
-    y_pred = model.predict(X_test_seq).flatten()
+    # ── 推理侧: 模型输出在差分空间, 累加还原回水平值空间 ─────────────────
+    y_pred_raw = model.predict(X_test_seq).flatten()
+    prob_raw = model.predict_probabilistic(X_test_seq)
+    if tt is not None:
+        y_pred = tt.inverse_transform(y_pred_raw, anchor=anchor)
+        if prob_raw.lower is not None and prob_raw.upper is not None:
+            prob_result = ProbabilisticPrediction(
+                mean=y_pred,
+                lower=tt.inverse_transform(prob_raw.lower.flatten(), anchor=anchor),
+                upper=tt.inverse_transform(prob_raw.upper.flatten(), anchor=anchor),
+            )
+        else:
+            prob_result = ProbabilisticPrediction(mean=y_pred)
+    else:
+        y_pred = y_pred_raw
+        prob_result = prob_raw
 
-    # 概率预测: MC Dropout 保持 Dropout 开启,多次采样取分位数
-    # Probabilistic prediction via MC Dropout sampling
-    prob_result = model.predict_probabilistic(X_test_seq)
-
-    # 反归一化到真实量纲后计算指标
-    # Denormalize to original scale for metric computation
+    # ── 反归一化到真实量纲后计算指标 ──────────────────────────────────────
     y_test_flat = y_test_seq.flatten()
     y_test_df = pd.DataFrame(y_test_flat.reshape(-1, 1), columns=[target_col])
     y_pred_df = pd.DataFrame(y_pred.reshape(-1, 1), columns=[target_col])
@@ -418,22 +400,32 @@ def main():
     processed_data, metadata = adapter.preprocess(raw_data)
     logger.info(f'  处理后形状: {processed_data.shape}')
 
-    # ── Step 4: 特征工程 ──────────────────────────────────────────────────
-    logger.info('\n[Step 4] 特征工程...')
-    feature_cfg = config.to_feature_config()
+    # ── Step 4 & 5: 序列构造 ──────────────────────────────────────────────────
+    logger.info('\n[Step 4 & 5] 构建 3D 滑动窗口序列 (N, seq_len, n_features)...')
     target_col = config.data.target_columns[0]
-
-    X_2d, y_1d, feat_dates, feature_cols = build_ml_features(
-        processed_data, target_col, feature_config=feature_cfg,
-    )
-    logger.info(f'  特征数量: {len(feature_cols)}')
-    logger.info(f'  2D 样本数量: {len(X_2d)}')
-
-    # ── Step 5: 2D→3D 序列构造 ───────────────────────────────────────────
-    logger.info('\n[Step 5] 2D 矩阵 → 3D 序列 (N, seq_len, n_features)...')
     seq_len = config.model.seq_len
-    X_seq, y_seq = build_dl_sequences(X_2d, y_1d, seq_len)
-    seq_dates = feat_dates[seq_len:]  # 丢弃前 seq_len 个点的预测目标
+    
+    # 获取所有数值列作为时序特征
+    time_varying_cols = list(processed_data.select_dtypes(include=[np.number]).columns)
+    # 确保 target_col 在第一列，这样 DLinear 用 num_targets=1 取前 1 列就正好是 target
+    if target_col in time_varying_cols:
+        time_varying_cols.remove(target_col)
+    time_varying_cols = [target_col] + time_varying_cols
+
+    handler = MixedFeatureHandler(
+        time_varying_cols=time_varying_cols,
+        static_cols=[],
+        target_col=target_col,
+        seq_len=seq_len,
+        pred_len=1
+    )
+    handler.fit(processed_data)
+    X_seq, y_seq = handler.create_sequences(processed_data)
+    
+    # create_sequences 会吃掉最前面的 seq_len 个时间步
+    seq_dates = processed_data.index[seq_len:]
+
+    logger.info(f'  特征顺序: {time_varying_cols}')
     logger.info(f'  3D 序列形状: X={X_seq.shape}, y={y_seq.shape}')
     logger.info(f'  输入特征维度 input_size = {X_seq.shape[-1]}')
 
@@ -481,6 +473,9 @@ def main():
         'probabilistic_method': 'mc_dropout',
         'num_samples': 50,                    # MC Dropout 采样次数
         'confidence_level': 0.95,
+        # RevIN (ICLR 2022) 已经在 _DLBaseModel **默认开启** (use_revin=True),
+        # 这里无需重复声明; 显式关闭请改 'use_revin': False.
+        # 长趋势 HPF 数据上 RevIN 把 5 个 Transformer 系列 MAPE 从 6-20% 降到 ~0.5%.
     }
 
     models_to_compare = ['lstm', 'transformer', 'autoformer',
@@ -495,12 +490,25 @@ def main():
             if model_name == 'dlinear':
                 cfg['probabilistic_method'] = 'quantile'
                 cfg['quantiles'] = [0.025, 0.5, 0.975]
-                # DLinear 用 quantile 回归，output_size 保持 1（预测步数）
+                # DLinear 用 quantile 回归; 单目标场景设 num_targets=1
+                # 避免 channel-independent 默认预测所有 input_size 个变量
+                cfg['num_targets'] = 1
+                cfg['pred_len'] = 1
             if model_name == 'timesnet':
                 # TimesNet 对 seq_len 的 FFT 有最小长度要求,数据不足时跳过
                 # TimesNet needs seq_len long enough for FFT period detection
                 pass
 
+            # 外推策略选择 / Extrapolation strategy:
+            #   RevIN (use_revin) 在 X 侧用 input window 自己的 (mean, std) 实现
+            #   "反归一化外推", 与 use_diff (Y 侧目标差分) 互斥:
+            #     - 同开会导致 RevIN 用 X(level) 量纲的 std/mean 给 Y(diff) 反归一化,
+            #       量纲错位, 实测 MAPE 飙到 2000%+.
+            #     - use_revin=True 时, 强制 use_diff=False, 让所有 DL 模型走 RevIN
+            #       路径, 模型形状统一, 也避免下游反差分逻辑分支.
+            # 默认 True 与 _DLBaseModel._init_revin 默认值保持一致.
+            # / RevIN and use_diff are mutually exclusive — default mirrors _DLBaseModel.
+            use_diff = (not cfg.get('use_revin', True)) and (model_name not in {'dlinear', 'itransformer'})
             res = train_and_evaluate_dl(
                 model_name, cfg,
                 X_train, y_train,
@@ -508,6 +516,7 @@ def main():
                 X_test, y_test,
                 adapter, metadata, logger,
                 target_col=target_col,
+                use_diff=use_diff,
             )
             results[model_name] = res
         except Exception as e:

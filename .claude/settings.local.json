@@ -73,7 +73,10 @@
       "Bash(rm docs/GUIDE.md docs/ARCHITECTURE.md docs/EXTENDING.md)",
       "Bash(python -m pytest tests/test_data_leakage.py -v --no-header)",
       "Bash(python -m pytest -x -q)",
-      "Bash(python pipelines/examples/feature_engineering_example.py)"
+      "Bash(python pipelines/examples/feature_engineering_example.py)",
+      "Bash(python pipelines/examples/hpf_dl_example.py)",
+      "Bash(python -W default -c ' *)",
+      "Bash(python -m pytest tests/test_target_transforms.py -v)"
     ]
   }
 }

@@ -48,6 +48,145 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x + self.pe[:, :x.size(1)])
 
 
+class RevIN(nn.Module):
+    """
+    Reversible Instance Normalization / 可逆实例归一化 (Kim et al., ICLR 2022).
+
+    动机 / Why:
+        Transformer/LSTM 内部的 LayerNorm/tanh 会把每个 hidden 强制压到 ~N(0,1) 邻域,
+        训练时见过 y ∈ [80, 680] 的数据, 测试时遇到 y ∈ [680, 800] (超出训练范围)
+        就会"反外推"—— 这是 DLinear 论文 (AAAI 2023) 反复指出的 Transformer 系列
+        在长趋势时序数据上集体失败的根本原因.
+
+        RevIN 把"绝对数值的尺度信息"挪到 **model 外**: 对每个 input window 按 channel
+        独立计算 mean/std, 归一化后丢给 model, model 学的是"相对模式";
+        预测出来后再把当前 input window 自己的 mean/std 加回去 → **自动外推到 input 的尺度**.
+
+    用法 / Usage:
+        revin = RevIN(num_features=C)
+        x_norm  = revin(x_raw, mode='norm')        # 给 model 的输入
+        y_norm  = model(x_norm)                    # model 内部 forward
+        y_pred  = revin.denorm_target(y_norm, target_channel=0)  # 单目标
+        # 或 y_pred = revin(y_norm, mode='denorm')                # 多目标(y 同 C)
+
+    Args:
+        num_features: input 张量末维通道数 (= input_size)
+        affine:       归一化后是否加可学习 γ/β (默认 True, 让 model 仍能学到偏移)
+        eps:          数值稳定项 (默认 1e-5)
+    """
+
+    def __init__(self, num_features: int, affine: bool = True, eps: float = 1e-5):
+        super().__init__()
+        self.num_features = num_features
+        self.affine = affine
+        self.eps = eps
+        if affine:
+            self.affine_weight = nn.Parameter(torch.ones(num_features))
+            self.affine_bias = nn.Parameter(torch.zeros(num_features))
+        # 推理 / 训练时每条样本的 (mean, stdev), forward 中按需缓存; detach 不进梯度
+        # / Per-sample stats cached during forward; detached so they don't enter the graph
+        self._mean: Optional[torch.Tensor] = None
+        self._stdev: Optional[torch.Tensor] = None
+
+    def forward(self, x: torch.Tensor, mode: str = 'norm') -> torch.Tensor:
+        if mode == 'norm':
+            return self._normalize(x)
+        if mode == 'denorm':
+            return self._denormalize(x)
+        raise ValueError(f"RevIN mode must be 'norm' or 'denorm', got {mode!r}")
+
+    def _normalize(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, L, C); 按 L 维聚合得到 (B, 1, C) 的 mean/std
+        self._mean = x.mean(dim=1, keepdim=True).detach()
+        self._stdev = torch.sqrt(
+            x.var(dim=1, keepdim=True, unbiased=False) + self.eps
+        ).detach()
+        x = (x - self._mean) / self._stdev
+        if self.affine:
+            x = x * self.affine_weight + self.affine_bias
+        return x
+
+    def _denormalize(self, y: torch.Tensor) -> torch.Tensor:
+        # y: (..., C) — 最后一维必须 == num_features
+        if self._mean is None:
+            raise RuntimeError(
+                "RevIN: 必须先 forward(mode='norm') 再 forward(mode='denorm')"
+            )
+        if self.affine:
+            y = (y - self.affine_bias) / (self.affine_weight + self.eps)
+        y = y * self._stdev + self._mean
+        return y
+
+    def denorm_target(self, y: torch.Tensor, target_channel: int = 0) -> torch.Tensor:
+        """
+        反归一化"单目标多步"输出: y shape (B, H) 或 (B, H, 1).
+
+        典型场景: LSTM / Transformer / Autoformer / iTransformer / TimesNet 的
+        输出是 (B, output_size) flat 向量, 默认目标在 input 的第 0 个 channel.
+
+        Args:
+            y: (B, H) 或 (B, H, 1)
+            target_channel: 用 input 的第几个 channel 的 (mean, std) 反归一化
+        """
+        if self._mean is None:
+            raise RuntimeError(
+                "RevIN: 必须先 forward(mode='norm') 再 denorm_target(...)"
+            )
+        # mean_t/std_t: (B, 1, 1)
+        mean_t = self._mean[:, :, target_channel:target_channel + 1]
+        std_t = self._stdev[:, :, target_channel:target_channel + 1]
+        if self.affine:
+            w = self.affine_weight[target_channel]
+            b = self.affine_bias[target_channel]
+            y = (y - b) / (w + self.eps)
+        if y.dim() == 2:
+            # (B, H) → 用 (B, 1) 广播
+            y = y * std_t.squeeze(-1) + mean_t.squeeze(-1)
+        else:
+            # (B, H, 1) → 用 (B, 1, 1) 广播
+            y = y * std_t + mean_t
+        return y
+
+    def denorm_multi_target(
+        self,
+        y: torch.Tensor,
+        num_targets: int,
+        per_target_len: int,
+    ) -> torch.Tensor:
+        """
+        反归一化"多目标"flat 输出 (DLinear 用).
+
+        约定: y 是 **target-major flatten**, 即 `[t0_e0..t0_e(K-1), t1_e0..t1_e(K-1), ...]`,
+        每个 target 占 `per_target_len` 个元素 (点预测 K=pred_len, 分位数 K=pred_len*Q).
+
+        每个 target 对应 input 的前 ``num_targets`` 个 channel; 用同一组 (μ, σ)
+        反归一化该 target 的全部 K 个元素 (分位数模式下: 不同分位数共用同一组 μ/σ).
+
+        Args:
+            y: (B, num_targets * per_target_len)
+            num_targets: 目标变量数 (= DLinear.num_targets, 对应 input 前 T 个 channel)
+            per_target_len: 每个 target 占多少元素
+                - 点预测: pred_len
+                - 分位数: pred_len * Q
+        """
+        if self._mean is None:
+            raise RuntimeError(
+                "RevIN: 必须先 forward(mode='norm') 再 denorm_multi_target(...)"
+            )
+        B = y.size(0)
+        # 取前 num_targets 个 channel 的统计 (B, T)
+        mean_t = self._mean[:, 0, :num_targets]
+        std_t = self._stdev[:, 0, :num_targets]
+        y = y.view(B, num_targets, per_target_len)
+        if self.affine:
+            w = self.affine_weight[:num_targets]
+            b = self.affine_bias[:num_targets]
+            y = (y - b.view(1, num_targets, 1)) / (w.view(1, num_targets, 1) + self.eps)
+        # 反归一化: y * std + mean, std/mean shape (B, T, 1)
+        y = y * std_t.unsqueeze(-1) + mean_t.unsqueeze(-1)
+        return y.contiguous().view(B, num_targets * per_target_len)
+
+
 def _dl_fit(model: 'BaseModel', train_data, val_data, config: dict) -> dict:
     """
     所有深度学习模型共享的训练循环 / Shared training loop for DL models.
@@ -89,6 +228,14 @@ def _dl_fit(model: 'BaseModel', train_data, val_data, config: dict) -> dict:
 
     history = {'train_loss': [], 'val_loss': []}
 
+    # ── 验证集预上传到设备 (循环外一次性完成, 避免每 epoch 重复 CPU→GPU 传输) ──
+    # / Pre-upload validation data to device once (eliminates per-epoch transfer overhead)
+    X_val_t, y_val_t = None, None
+    if val_data is not None:
+        X_val, y_val = val_data
+        X_val_t = torch.FloatTensor(X_val).to(device)
+        y_val_t = torch.FloatTensor(y_val).to(device)
+
     n_train = len(X_train)
     for epoch in range(epochs):
         model.train()
@@ -127,13 +274,17 @@ def _dl_fit(model: 'BaseModel', train_data, val_data, config: dict) -> dict:
         avg_loss = total_loss / n_train
         history['train_loss'].append(avg_loss)
 
-        if val_data is not None:
+        if X_val_t is not None:
             model.eval()
-            X_val, y_val = val_data
-            X_val = torch.FloatTensor(X_val).to(device)
-            y_val = torch.FloatTensor(y_val).to(device)
+            val_loss_sum = 0.0
+            n_val = len(X_val_t)
             with torch.no_grad():
-                val_loss = model.criterion(model(X_val), y_val).item()
+                for i in range(0, n_val, batch_size):
+                    batch_x_val = X_val_t[i:i + batch_size]
+                    batch_y_val = y_val_t[i:i + batch_size]
+                    loss = model.criterion(model(batch_x_val), batch_y_val)
+                    val_loss_sum += loss.item() * batch_x_val.size(0)
+            val_loss = val_loss_sum / n_val
             history['val_loss'].append(val_loss)
             print(f'Epoch {epoch+1}/{epochs}  Train: {avg_loss:.4f}  Val: {val_loss:.4f}')
         else:
@@ -161,8 +312,13 @@ def _dl_predict(model: 'BaseModel', test_data, device: str) -> np.ndarray:
     model.eval()
     X = test_data[0] if isinstance(test_data, tuple) else test_data
     X = torch.FloatTensor(X).to(device)
+    batch_size = model.config.get('batch_size', 512) if hasattr(model, 'config') else 512
+    
+    preds = []
     with torch.no_grad():
-        return model(X).cpu().numpy()
+        for i in range(0, len(X), batch_size):
+            preds.append(model(X[i:i+batch_size]).cpu().numpy())
+    return np.concatenate(preds, axis=0)
 
 
 def _mc_dropout_predict(
@@ -211,10 +367,15 @@ def _mc_dropout_predict(
     X = test_data[0] if isinstance(test_data, tuple) else test_data
     X = torch.FloatTensor(X).to(device)
     model.train()  # 激活 Dropout / Activate Dropout layers
+    batch_size = model.config.get('batch_size', 512) if hasattr(model, 'config') else 512
+    
     preds = []
     with torch.no_grad():
         for _ in range(num_samples):
-            preds.append(model(X).cpu().numpy())
+            sample_preds = []
+            for i in range(0, len(X), batch_size):
+                sample_preds.append(model(X[i:i+batch_size]).cpu().numpy())
+            preds.append(np.concatenate(sample_preds, axis=0))
     preds = np.array(preds)            # (S, N, output_size)
     mean = np.mean(preds, axis=0)
     std = np.std(preds, axis=0)
@@ -262,6 +423,53 @@ class _DLBaseModel(BaseModel):
             )
         return ProbabilisticPrediction(mean=self.predict(test_data))
 
+    # ------------------------------------------------------------------
+    # RevIN 集成 (可选, 由 config['use_revin'] 开关)
+    # / Optional RevIN integration switched on by config['use_revin']
+    # ------------------------------------------------------------------
+    def _init_revin(self, num_features: int) -> None:
+        """
+        子类 __init__ 中, 在 self.to(self.device) 之前调用以(可选)创建 RevIN.
+
+        **默认开启** (use_revin=True): 经 hpf_dl_example 实测, 在长趋势时序数据上
+        RevIN 把 LSTM/Transformer/Autoformer/iTransformer/TimesNet 的 test MAPE
+        从 6-20% 降到 ~0.5% (12-39× 改善), 对 DLinear 几乎平 (本就能外推).
+        对短期/平稳序列也无害 — 退化为 instance-wise z-score, 不引入偏置.
+
+        显式关闭: ``config['use_revin'] = False``.
+
+        Args:
+            num_features: input 末维通道数 (一般 = self.input_size)
+        """
+        # 默认 True: 长趋势数据上是更安全的归一化策略, 短期/平稳序列也无负面
+        # / Default to True: safer normalisation for trend-bearing series,
+        #   neutral on stationary ones.
+        if self.config.get('use_revin', True):
+            affine = self.config.get('revin_affine', True)
+            self.revin = RevIN(num_features=num_features, affine=affine)
+        else:
+            self.revin = None
+
+    def _maybe_revin_norm(self, x: torch.Tensor) -> torch.Tensor:
+        """forward 入口调用: 若启用 RevIN 就归一化, 否则透传."""
+        if self.revin is not None:
+            return self.revin(x, mode='norm')
+        return x
+
+    def _maybe_revin_denorm_target(
+        self, y: torch.Tensor, target_channel: int = 0,
+    ) -> torch.Tensor:
+        """
+        forward 出口调用 (单目标多步): 若启用 RevIN 就反归一化到 input 的尺度.
+
+        约定: target 默认在 input 的第 0 个 channel, 由 config['revin_target_channel']
+        覆盖 (一般 HPF/通用单目标场景默认 0 即可).
+        """
+        if self.revin is not None:
+            ch = self.config.get('revin_target_channel', target_channel)
+            return self.revin.denorm_target(y, target_channel=ch)
+        return y
+
 
 # ─── LSTM ─────────────────────────────────────────────────────────────────────
 
@@ -287,6 +495,9 @@ class LSTMModel(_DLBaseModel):
         self.dropout_layer = nn.Dropout(p=self.dropout_rate)
         self.fc = nn.Linear(self.hidden_size, self.output_size)
 
+        # 可选: RevIN 解决数值外推 (config['use_revin']=True 时启用)
+        self._init_revin(num_features=self.input_size)
+
         self.criterion = nn.MSELoss()
         # 把所有参数搬到目标设备, 必须在 optimizer 创建之前
         # 否则 optimizer 绑定的是 CPU 参数引用, 即使后续 .to(cuda) 也指不回来
@@ -297,8 +508,10 @@ class LSTMModel(_DLBaseModel):
         )
 
     def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+        x = self._maybe_revin_norm(x)
         out, _ = self.lstm(x)
-        return self.fc(self.dropout_layer(out[:, -1, :]))
+        out = self.fc(self.dropout_layer(out[:, -1, :]))
+        return self._maybe_revin_denorm_target(out)
 
 
 # ─── Transformer ──────────────────────────────────────────────────────────────
@@ -332,6 +545,9 @@ class TransformerModel(_DLBaseModel):
         )
         self.decoder = nn.Linear(self.d_model, self.output_size)
 
+        # 可选: RevIN 解决数值外推
+        self._init_revin(num_features=self.input_size)
+
         self.criterion = nn.MSELoss()
         # 把所有参数搬到目标设备, 必须在 optimizer 创建之前 (见 LSTMModel 注释)
         self.to(self.device)
@@ -360,11 +576,13 @@ class TransformerModel(_DLBaseModel):
                 间接污染末位 hidden state
               * Causal mask 只在 *autoregressive decoder* 场景下需要 (本类不是)
         """
+        x = self._maybe_revin_norm(x)
         x = self.pos_encoder(self.input_proj(x))
         # 双向自注意力: 不传 mask, 让历史窗口的所有时间步互相可见
         # / Bidirectional self-attention over the already-known history
         x = self.transformer_encoder(x)
-        return self.decoder(x[:, -1, :])
+        out = self.decoder(x[:, -1, :])
+        return self._maybe_revin_denorm_target(out)
 
 
 # ─── Autoformer ───────────────────────────────────────────────────────────────
@@ -515,13 +733,34 @@ class Autoformer(_DLBaseModel):
         super().__init__(config)
         self.model_name = 'autoformer'
         self.input_size = config.get('input_size', 1)
+        self.seq_len = config.get('seq_len', 96)
         self.d_model = config.get('d_model', 256)
         self.n_heads = config.get('nhead', 8)
         self.num_layers = config.get('num_layers', 3)
         self.d_ff = config.get('dim_feedforward', 1024)
         self.dropout_rate = config.get('dropout', 0.1)
         self.output_size = config.get('output_size', 1)
-        self.kernel_size = config.get('moving_avg_kernel', 25)
+        # MovingAvg 内部会把偶数 kernel 自动 +1 改奇,
+        # 但**不防御** kernel >= seq_len 的情况: 此时 SeriesDecomp 的
+        # 对称 padding 会让"趋势"退化成单值常量, 训练 loss 卡死.
+        # 这里在构造前显式校验, 不满足就自动降为 seq_len//3 (再奇数化),
+        # 保证 kernel <= seq_len - 1 且为奇数.
+        # / Guard: shrink kernel_size to seq_len//3 (odd) when it's >= seq_len,
+        #   otherwise SeriesDecomp degenerates and training loss never drops.
+        req_kernel = config.get('moving_avg_kernel', 25)
+        if req_kernel >= self.seq_len:
+            new_k = max(3, self.seq_len // 3)
+            new_k = new_k if new_k % 2 == 1 else new_k + 1
+            import warnings
+            warnings.warn(
+                f"Autoformer: moving_avg_kernel={req_kernel} >= seq_len={self.seq_len}, "
+                f"SeriesDecomp 会退化为常量趋势导致训练失败. "
+                f"已自动调整 kernel_size -> {new_k} (seq_len//3 奇数化).",
+                RuntimeWarning, stacklevel=2,
+            )
+            self.kernel_size = new_k
+        else:
+            self.kernel_size = req_kernel
         self.factor = config.get('autocorr_factor', 1)
 
         self.input_proj = nn.Linear(self.input_size, self.d_model)
@@ -536,6 +775,9 @@ class Autoformer(_DLBaseModel):
         self.norm = nn.LayerNorm(self.d_model)
         self.projection = nn.Linear(self.d_model, self.output_size)
 
+        # 可选: RevIN 解决数值外推
+        self._init_revin(num_features=self.input_size)
+
         self.criterion = nn.MSELoss()
         # 把所有参数搬到目标设备, 必须在 optimizer 创建之前 (见 LSTMModel 注释)
         self.to(self.device)
@@ -544,10 +786,12 @@ class Autoformer(_DLBaseModel):
         )
 
     def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+        x = self._maybe_revin_norm(x)
         x = self.pos_encoder(self.input_proj(x))
         for layer in self.encoder_layers:
             x = layer(x)
-        return self.projection(self.norm(x[:, -1, :]))
+        out = self.projection(self.norm(x[:, -1, :]))
+        return self._maybe_revin_denorm_target(out)
 
 
 # ─── iTransformer ─────────────────────────────────────────────────────────────
@@ -589,6 +833,9 @@ class iTransformer(_DLBaseModel):
         # 将所有变量嵌入展平后映射到预测输出
         self.output_proj = nn.Linear(self.input_size * self.d_model, self.output_size)
 
+        # 可选: RevIN 解决数值外推
+        self._init_revin(num_features=self.input_size)
+
         self.criterion = nn.MSELoss()
         # 把所有参数搬到目标设备, 必须在 optimizer 创建之前 (见 LSTMModel 注释)
         self.to(self.device)
@@ -599,6 +846,17 @@ class iTransformer(_DLBaseModel):
     def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
         # x: (B, L, N)
         B, L, N = x.shape
+        # ── 运行时校验: 输入 L 必须与 config['seq_len'] 一致 ──────────
+        # variate_proj 是 nn.Linear(seq_len, d_model), 输入 L 不匹配会
+        # 导致 shape error. 在这里显式报错, 给出可操作的修复建议.
+        # / Runtime check: input L must match configured seq_len.
+        if L != self.seq_len:
+            raise ValueError(
+                f"iTransformer 输入 seq_len={L} 与配置 seq_len={self.seq_len} 不匹配. "
+                f"请确保 MixedFeatureHandler.seq_len 或滑窗长度 == config['seq_len']. "
+                f"/ Input sequence length {L} != configured seq_len {self.seq_len}."
+            )
+        x = self._maybe_revin_norm(x)
         # 逆转：每个变量的 L 步历史 → 嵌入
         x_inv = x.permute(0, 2, 1)          # (B, N, L)
         x_emb = self.variate_proj(x_inv)    # (B, N, d_model)
@@ -606,7 +864,8 @@ class iTransformer(_DLBaseModel):
         x_enc = self.norm(self.transformer(x_emb))  # (B, N, d_model)
         # 展平所有变量嵌入，投影到输出
         out = x_enc.contiguous().view(B, -1)         # (B, N * d_model)
-        return self.output_proj(out)                  # (B, output_size)
+        out = self.output_proj(out)                  # (B, output_size)
+        return self._maybe_revin_denorm_target(out)
 
 
 # ─── TimesNet ─────────────────────────────────────────────────────────────────
@@ -664,6 +923,19 @@ class TimesNet(_DLBaseModel):
         self.dropout_rate = config.get('dropout', 0.1)
         self.output_size = config.get('output_size', 1)
 
+        # ── 序列长度最小值校验 ─────────────────────────────────────────
+        # TimesNet 的 FFT 周期检测需要足够的频率分辨率; seq_len 过小时
+        # 候选周期退化 (全部被 clamp 到 2), 2D 卷积几乎无意义.
+        # 建议 seq_len >= 2 * top_k, 且至少 >= 8.
+        # / Minimum seq_len guard: FFT period detection degrades on very short sequences.
+        _min_seq = max(8, 2 * self.top_k)
+        if self.seq_len < _min_seq:
+            raise ValueError(
+                f"TimesNet 要求 seq_len >= {_min_seq} (当前 {self.seq_len}). "
+                f"序列过短会导致 FFT 周期检测退化, 2D 卷积无法有效建模周期. "
+                f"/ seq_len must be >= {_min_seq} for meaningful period detection."
+            )
+
         self.input_proj = nn.Linear(self.input_size, self.d_model)
         self.times_blocks = nn.ModuleList([
             TimesBlock2D(self.d_model, dropout=self.dropout_rate) for _ in range(self.num_layers)
@@ -673,6 +945,9 @@ class TimesNet(_DLBaseModel):
         ])
         self.dropout_layer = nn.Dropout(self.dropout_rate)
         self.output_proj = nn.Linear(self.d_model, self.output_size)
+
+        # 可选: RevIN 解决数值外推
+        self._init_revin(num_features=self.input_size)
 
         self.criterion = nn.MSELoss()
         # 把所有参数搬到目标设备, 必须在 optimizer 创建之前 (见 LSTMModel 注释)
@@ -782,6 +1057,7 @@ class TimesNet(_DLBaseModel):
             (periods 列表至少含 1 个元素),无需额外保护
         """
         # x: (B, L, C) 输入,C 是原始变量数
+        x = self._maybe_revin_norm(x)
         x = self.input_proj(x)          # → (B, L, d_model)
         L = x.size(1)
         periods = self._detect_periods(x.detach())
@@ -799,7 +1075,8 @@ class TimesNet(_DLBaseModel):
             x = ln(x + sum(contributions) / len(contributions))
 
         # 取最后时间步 → Dropout → 映射输出 / Last step → Dropout → output projection
-        return self.output_proj(self.dropout_layer(x[:, -1, :]))
+        out = self.output_proj(self.dropout_layer(x[:, -1, :]))
+        return self._maybe_revin_denorm_target(out)
 
 
 # ─── DLinear ──────────────────────────────────────────────────────────────────
@@ -818,6 +1095,9 @@ class PinballLoss(nn.Module):
     对每个分位数 q ∈ quantiles 分别计算后取均值，
     驱动模型同时学习多个分位数的条件分布。
 
+    支持多目标多步: preds (B, T*H*Q), target (B, T*H)
+    其中 T=num_targets, H=pred_len, Q=len(quantiles)。
+
     Args:
         quantiles: 分位数列表，如 [0.025, 0.5, 0.975]
     """
@@ -828,23 +1108,25 @@ class PinballLoss(nn.Module):
     def forward(self, preds: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            preds:  (B, H * Q) — 模型输出，H 个时间步 × Q 个分位数交织
-            target: (B, H)     — 真实值
+            preds:  (B, total_out * Q) — 模型输出, total_out = T*H (多目标×多步)
+            target: (B, total_out)     — 真实值
 
         流程:
-          1. preds reshape → (B, H, Q)
-          2. target unsqueeze → (B, H, 1) 广播对齐
-          3. 逐分位数计算 pinball loss 后取全局均值
+          1. 由 preds / target 尺寸推断 total_out = target 末维
+          2. preds reshape → (B, total_out, Q)
+          3. target unsqueeze → (B, total_out, 1) 广播对齐
+          4. 逐分位数计算 pinball loss 后取全局均值
         """
-        B, H = target.shape
         Q = len(self.quantiles)
-        preds = preds.view(B, H, Q)          # (B, H, Q)
-        target = target.unsqueeze(-1)         # (B, H, 1) → 广播到 (B, H, Q)
-        errors = target - preds               # (B, H, Q)
+        # target: (B, total_out) where total_out = num_targets * pred_len
+        total_out = target.shape[-1]
+        preds = preds.view(-1, total_out, Q)  # (B, total_out, Q)
+        target = target.unsqueeze(-1)         # (B, total_out, 1) → 广播到 (B, total_out, Q)
+        errors = target - preds               # (B, total_out, Q)
         loss = torch.max(
             self.quantiles * errors,
             (self.quantiles - 1) * errors
-        )                                     # (B, H, Q)
+        )                                     # (B, total_out, Q)
         return loss.mean()
 
 
@@ -857,46 +1139,58 @@ class DLinear(_DLBaseModel):
       seasonal, trend = SeriesDecomp(x)
       pred = Linear_Seasonal(seasonal) + Linear_Trend(trend)
 
+    多目标多步预测 / Multi-target multi-step prediction:
+      Channel-independent 架构天然支持多变量: 每个输入变量经 SeriesDecomp 分解后
+      独立通过线性层映射到 pred_len 步输出, 所有变量的预测拼接返回。
+      The channel-independent architecture naturally supports multi-variate:
+      each input variable is decomposed and independently mapped to pred_len
+      future steps via separate linear projections; all channels are concatenated.
+
+      - num_targets: 目标变量数, 默认 = input_size (channel-independent, 预测所有输入变量)
+                     可通过 config['num_targets'] 显式指定只预测前 T 个变量
+      - pred_len:    每个变量预测几步, 默认 = output_size (向后兼容单步场景)
+      - output_size: 总输出维度 = num_targets * pred_len (自动计算, 勿手动设置)
+
     概率预测 / Probabilistic prediction:
-      probabilistic_method = 'quantile' 时，输出层扩展为 output_size * Q，
+      probabilistic_method = 'quantile' 时，输出层扩展为 pred_len * Q，
       一次前向同时预测 Q 个分位数，损失函数切换为 PinballLoss。
       置信区间由最低/最高分位数构成，中位数（q=0.5）作为点预测 mean。
 
     配置示例 / Config example:
+      # 单目标单步 (向后兼容)
+      config = {'seq_len': 24, 'input_size': 1, 'output_size': 1}
+
+      # 多目标多步
       config = {
           'seq_len': 24,
-          'output_size': 1,
-          'input_size': 5,
-          'moving_avg_kernel': 5,
-          'probabilistic_method': 'quantile',          # 启用分位数回归
-          'quantiles': [0.025, 0.1, 0.5, 0.9, 0.975], # 可自定义
-          'confidence_level': 0.95,                    # 决定取哪两端分位数作 CI
+          'input_size': 5,          # 5 个输入变量
+          'num_targets': 3,         # 预测前 3 个变量 (可省略, 默认=input_size)
+          'pred_len': 6,            # 每个变量预测 6 步
+          'probabilistic_method': 'quantile',
+          'quantiles': [0.025, 0.5, 0.975],
       }
-
-    Channel-independent:
-      N 个变量各自独立映射（permute 实现），不建模变量间相关性。
     """
     def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
         self.model_name = 'dlinear'
         self.input_size  = config.get('input_size', 1)
         self.seq_len     = config.get('seq_len', 96)
-        self.output_size = config.get('output_size', 1)
         self.kernel_size = config.get('moving_avg_kernel', 25)
 
-        # Fail-fast: 当前实现是 channel-independent + 取第 0 个变量做目标,
-        # 多变量输入 (input_size > 1) 时会**静默丢弃**后 N-1 个变量的预测,
-        # 极易让用户排查"预测对不上"。明确拒绝, 而不是悄悄吞掉。
-        # 真要多目标? 请在外层用 MultiTargetMonitor 组合多个独立 DLinear 实例,
-        # 或者改 forward 返回 out.permute(0, 2, 1).reshape(B, -1) 走多输出路径
-        # (本类不在 P0 范围内做这件事).
-        # / Reject multi-variate input explicitly to prevent silent drop.
-        if self.input_size != 1:
+        # ── 多目标多步维度解析 ─────────────────────────────────────────────
+        # num_targets: 预测几个目标变量 (默认 = input_size, channel-independent)
+        # pred_len:    每个变量预测几步 (默认 = output_size 或 1, 向后兼容)
+        # output_size: 总输出 = num_targets * pred_len (自动计算)
+        # / Multi-target multi-step dimension parsing
+        self.num_targets = config.get('num_targets', self.input_size)
+        self.pred_len    = config.get('pred_len', config.get('output_size', 1))
+        self.output_size = self.num_targets * self.pred_len
+
+        if self.num_targets > self.input_size:
             raise ValueError(
-                f"DLinear 当前实现仅支持单变量输入 (input_size=1), "
-                f"传入 input_size={self.input_size} 会导致除第 0 个变量外的预测被静默丢弃. "
-                f"多目标场景请用 MultiTargetMonitor 组合多个 DLinear 实例, "
-                f"或改用支持多变量输出的模型 (LSTM/Transformer)."
+                f"num_targets({self.num_targets}) 不能大于 input_size({self.input_size}). "
+                f"Channel-independent 架构最多预测 input_size 个变量. "
+                f"/ num_targets cannot exceed input_size."
             )
 
         # 分位数配置 / Quantile config
@@ -908,15 +1202,33 @@ class DLinear(_DLBaseModel):
         self.Q = len(self.quantiles)
 
         # 是否启用分位数回归 / Whether to use quantile regression
+        self.use_quantile = (self.probabilistic_method == 'quantile')
 
-        self.use_quantile = (self.probabilistic_method  == 'quantile')
-        # 输出维度: 点预测 = output_size，分位数模式 = output_size * Q
-        # Output dim: point = H, quantile = H * Q
-        out_dim = self.output_size * self.Q if self.use_quantile else self.output_size
+        # 每个变量的线性层输出维度:
+        #   点预测 = pred_len, 分位数 = pred_len * Q
+        # / Per-channel linear output dim
+        per_ch_out = self.pred_len * self.Q if self.use_quantile else self.pred_len
 
-        self.decomp          = SeriesDecomp(self.kernel_size)
-        self.linear_trend    = nn.Linear(self.seq_len, out_dim)
-        self.linear_seasonal = nn.Linear(self.seq_len, out_dim)
+        self.decomp = SeriesDecomp(self.kernel_size)
+        self.cross_channel = config.get('cross_channel', False)
+
+        # ── 跨通道融合选项 (Channel-Dependent vs Channel-Independent) ──
+        if self.cross_channel:
+            # 纯跨通道模式 (CDLinear): 
+            # 直接将 (seq_len * input_size) 映射到 (num_targets * per_ch_out)。
+            # 真正实现多输入共用特征去预测多输出。
+            self.linear_trend = nn.Linear(
+                self.seq_len * self.input_size, 
+                self.num_targets * per_ch_out
+            )
+            self.linear_seasonal = nn.Linear(
+                self.seq_len * self.input_size, 
+                self.num_targets * per_ch_out
+            )
+        else:
+            # 经典模式 (CILinear): 各通道独立，权重共享
+            self.linear_trend    = nn.Linear(self.seq_len, per_ch_out)
+            self.linear_seasonal = nn.Linear(self.seq_len, per_ch_out)
 
         # 损失函数: 分位数模式用 PinballLoss，否则 MSE
         # Loss: PinballLoss for quantile mode, MSE otherwise.
@@ -924,6 +1236,9 @@ class DLinear(_DLBaseModel):
             self.criterion = PinballLoss(self.quantiles)
         else:
             self.criterion = nn.MSELoss()
+
+        # 可选: RevIN 解决数值外推 (DLinear 用 denorm_multi_target 处理多目标 flat 输出)
+        self._init_revin(num_features=self.input_size)
 
         # 把所有参数搬到目标设备, 必须在 optimizer 创建之前 (见 LSTMModel 注释)
         self.to(self.device)
@@ -942,53 +1257,86 @@ class DLinear(_DLBaseModel):
 
     def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
         """
+        Channel-independent 前向传播 / Channel-independent forward pass.
+
+        每个输入变量独立经过 SeriesDecomp + Linear, 取前 num_targets 个变量的
+        预测拼接返回. 当 num_targets == input_size 时预测所有输入变量.
+
         Args:
-            x: (B, L, N)
+            x: (B, L, N), N = input_size
 
         Returns:
-            点预测模式: (B, output_size)
-            分位数模式: (B, output_size * Q)，调用方负责 reshape 为 (B, H, Q)
+            点预测模式:   (B, num_targets * pred_len)
+            分位数模式:   (B, num_targets * pred_len * Q)
         """
+        B = x.size(0)
+        # RevIN 归一化 (按 channel) — DLinear 跨通道模式下同样适用
+        x = self._maybe_revin_norm(x)
         seasonal, trend = self.decomp(x)                          # 各 (B, L, N)
 
-        # (B, L, N) → permute → (B, N, L) → Linear → (B, N, out_dim)
-        seasonal_out = self.linear_seasonal(seasonal.permute(0, 2, 1))
-        trend_out    = self.linear_trend(trend.permute(0, 2, 1))
+        if getattr(self, 'cross_channel', False):
+            # 跨通道模式: 展平时间与变量维度 (B, L * N)
+            seasonal_flat = seasonal.contiguous().view(B, -1)
+            trend_flat = trend.contiguous().view(B, -1)
 
-        out = seasonal_out + trend_out                             # (B, N, out_dim)
+            # 直接一步映射到目标维度 (B, num_targets * per_ch_out)
+            seasonal_out = self.linear_seasonal(seasonal_flat)
+            trend_out = self.linear_trend(trend_flat)
+            out = seasonal_out + trend_out
+        else:
+            # 经典 CI 模式: (B, L, N) → permute → (B, N, L) → Linear → (B, N, per_ch_out)
+            seasonal_out = self.linear_seasonal(seasonal.permute(0, 2, 1))
+            trend_out    = self.linear_trend(trend.permute(0, 2, 1))
+            out = seasonal_out + trend_out
 
-        # __init__ 已经断言 input_size == 1, 这里 N=1, [:, 0, :] 等价取唯一变量
-        # / N==1 by __init__ guard; this slice picks the single variate
-        return out[:, 0, :].contiguous()                           # (B, out_dim)
+            # 只截取前 num_targets 个变量的独立预测
+            out = out[:, :self.num_targets, :].contiguous().view(B, -1)
+
+        # RevIN 反归一化:
+        # - 点预测: 每个 target 占 pred_len 元素
+        # - 分位数: 每个 target 占 pred_len * Q 元素 (不同分位数共用同一组 μ/σ)
+        if self.revin is not None:
+            per_target_len = self.pred_len * self.Q if self.use_quantile else self.pred_len
+            out = self.revin.denorm_multi_target(
+                out, num_targets=self.num_targets, per_target_len=per_target_len,
+            )
+        return out
 
     # fit 沿用 _DLBaseModel.fit (_dl_fit 训练循环)。
-    # 分位数模式下 y_train 形状仍为 (N, output_size),PinballLoss 内部自动处理维度对齐。
+    # 分位数模式下 y_train 形状为 (N, num_targets * pred_len),
+    # PinballLoss 内部自动处理维度对齐。
     # Reuse _DLBaseModel.fit; PinballLoss handles dim alignment internally.
 
     def predict(self, test_data, **kwargs) -> np.ndarray:
         """
-        点预测: 分位数模式下返回中位数（q=0.5 对应的分位数）。
-        Point prediction: returns median quantile in quantile mode.
+        点预测 / Point prediction.
+
+        分位数模式下返回中位数（q=0.5 对应的分位数）。
+        Returns median quantile in quantile mode.
+
+        Returns:
+            (N, num_targets * pred_len) — 与 y_train 同形
         """
-        raw = _dl_predict(self, test_data, self.device)  # (N, out_dim)
+        raw = _dl_predict(self, test_data, self.device)  # (N, flat_out)
         if not self.use_quantile:
             return raw
         # 找 q=0.5 最近的分位数索引作为点预测
         median_idx = int(np.argmin(np.abs(np.array(self.quantiles) - 0.5)))
         N = raw.shape[0]
-        # raw: (N, H*Q) → (N, H, Q) → 取 median_idx → (N, H)
-        return raw.reshape(N, self.output_size, self.Q)[:, :, median_idx]
+        total_out = self.num_targets * self.pred_len
+        # raw: (N, total_out * Q) → (N, total_out, Q) → 取 median → (N, total_out)
+        return raw.reshape(N, total_out, self.Q)[:, :, median_idx]
 
     def _predict_probabilistic(self, test_data, **kwargs) -> ProbabilisticPrediction:
         """
         分位数概率预测 / Quantile probabilistic prediction.
 
         返回:
-          mean  = 中位数分位数预测（q≈0.5）
+          mean  = 中位数分位数预测（q≈0.5）, shape (N, num_targets * pred_len)
           lower = alpha/2 分位数（如 q=0.025）
           upper = 1-alpha/2 分位数（如 q=0.975）
           std   = (upper - lower) / (2 * 1.96)，高斯近似标准差，供参考
-          samples = 所有分位数预测，形状 (Q, N, H)
+          samples = 所有分位数预测，形状 (Q, N, total_out)
 
         若未启用分位数模式，退化为确定性预测并给出警告。
         Falls back to deterministic if quantile mode is not enabled.
@@ -1003,9 +1351,10 @@ class DLinear(_DLBaseModel):
             mean = self.predict(test_data)
             return ProbabilisticPrediction(mean=mean)
 
-        raw = _dl_predict(self, test_data, self.device)   # (N, H*Q)
+        raw = _dl_predict(self, test_data, self.device)   # (N, total_out * Q)
         N = raw.shape[0]
-        all_quantiles = raw.reshape(N, self.output_size, self.Q)  # (N, H, Q)
+        total_out = self.num_targets * self.pred_len
+        all_quantiles = raw.reshape(N, total_out, self.Q)  # (N, total_out, Q)
 
         alpha = 1 - self.confidence_level
         q_arr = np.array(self.quantiles)
@@ -1015,13 +1364,13 @@ class DLinear(_DLBaseModel):
         upper_idx  = int(np.argmin(np.abs(q_arr - (1 - alpha / 2))))
         median_idx = int(np.argmin(np.abs(q_arr - 0.5)))
 
-        mean  = all_quantiles[:, :, median_idx]   # (N, H)
-        lower = all_quantiles[:, :, lower_idx]    # (N, H)
-        upper = all_quantiles[:, :, upper_idx]    # (N, H)
+        mean  = all_quantiles[:, :, median_idx]   # (N, total_out)
+        lower = all_quantiles[:, :, lower_idx]    # (N, total_out)
+        upper = all_quantiles[:, :, upper_idx]    # (N, total_out)
         # 高斯近似 std，仅供参考（非严格统计量）
         std = (upper - lower) / (2 * 1.96)
 
-        # samples: (Q, N, H)，与 mc_dropout 的 (S, N, H) 接口对齐
+        # samples: (Q, N, total_out)，与 mc_dropout 的 (S, N, H) 接口对齐
         samples = all_quantiles.transpose(2, 0, 1)
 
         return ProbabilisticPrediction(
