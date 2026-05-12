@@ -26,13 +26,31 @@ class PretrainedMoiraiModel(BaseModel):
         self.size = config.get('moirai_size', 'small')  # 'small', 'base', 'large'
         
         try:
-            from uni2ts.model.moirai import MoiraiForecast
-            # 首次运行会自动从 HuggingFace 下载对应权重的 checkpoint
-            # 建议全局代理或提前通过 HF_ENDPOINT 镜像下载
-            self.pretrained_model = MoiraiForecast.load_from_checkpoint(
-                f"Salesforce/moirai-1.0-R-{self.size}",
-                module_kwargs={'min_patches': 2, 'min_mask_ratio': 0.15, 'max_mask_ratio': 0.5, 'multi_dim': True}
+            from uni2ts.model.moirai import MoiraiForecast, MoiraiModule
+            import os
+            
+            repo_id = f"Salesforce/moirai-1.0-R-{self.size}"
+            pred_len = config.get('pred_len', 1)
+            seq_len = config.get('seq_len', 24)
+            # 默认假设输入的列全是预测目标列 (multi_dim)
+            # 如果你有 covariates，需要修改 feat_dynamic_real_dim
+            features_dim = config.get('num_features', 1) 
+            
+            # 将模型权重下载并缓存到项目目录下的 pretrained_models 文件夹中
+            cache_dir = os.path.join(os.getcwd(), 'pretrained_models')
+            os.makedirs(cache_dir, exist_ok=True)
+            
+            self.pretrained_model = MoiraiForecast(
+                module=MoiraiModule.from_pretrained(repo_id, cache_dir=cache_dir),
+                prediction_length=pred_len,
+                context_length=seq_len,
+                patch_size='auto',
+                num_samples=100,
+                target_dim=features_dim,
+                feat_dynamic_real_dim=0,
+                past_feat_dynamic_real_dim=0,
             )
+            
             self.pretrained_model.to(self.device)
             # MoiraiForecast 返回的是分布预测器
             self.predictor = self.pretrained_model.create_predictor(batch_size=config.get('batch_size', 16))
@@ -96,13 +114,16 @@ class PretrainedMoiraiModel(BaseModel):
             # 将 (N, seq_len, features) 转化为 N 个独立的 time series dict
             ds_list = []
             for i in range(N):
-                # GluonTS expects shape (features, seq_len)
+                # GluonTS expects shape (features, seq_len) or (seq_len,) for 1D
                 target = X_test[i].T
+                if num_features == 1:
+                    target = target.flatten()
+                
                 ds_list.append({
                     "start": pd.Timestamp("2000-01-01"), # 任意起始时间
                     "target": target
                 })
-            dataset = ListDataset(ds_list, freq="M", one_dim_target=False)
+            dataset = ListDataset(ds_list, freq="M", one_dim_target=(num_features==1))
             
             # 覆盖 prediction_length
             self.pretrained_model.prediction_length = pred_len

@@ -88,10 +88,8 @@ get_policy_adjusted_forecast（政策模拟）
         # / Whether fit_preprocess has been called
         self._is_fitted: bool = False
 
-# Validate NON_NEGATIVE_COLS are subset of target_columns
-missing_non_neg = set(self.NON_NEGATIVE_COLS) - set(self.target_columns)
-if missing_non_neg:
-    raise ValueError(f"NON_NEGATIVE_COLS {missing_non_neg} not found in target_columns")
+        # We don't need to force target_columns to contain all NON_NEGATIVE_COLS.
+        # It's perfectly fine to only predict one column (e.g., 'monthly_deposit').
 
     # ── 预处理 ───────────────────────────────────────────────────────────────
 
