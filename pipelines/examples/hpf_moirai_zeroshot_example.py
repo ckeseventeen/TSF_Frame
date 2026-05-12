@@ -145,7 +145,7 @@ def main():
         'batch_size': 16,
         'pred_len': pred_len,
         'device': device,
-        'revin_target_channel': 0
+        'target_idx': 0
     }
     
     model = get_moirai_model('moirai_zeroshot', moirai_config)

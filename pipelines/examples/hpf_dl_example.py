@@ -473,8 +473,8 @@ def main():
         'probabilistic_method': 'mc_dropout',
         'num_samples': 50,                    # MC Dropout 采样次数
         'confidence_level': 0.95,
+        'use_revin': True,                    # 显式开启 RevIN (可逆实例归一化)
         # RevIN (ICLR 2022) 已经在 _DLBaseModel **默认开启** (use_revin=True),
-        # 这里无需重复声明; 显式关闭请改 'use_revin': False.
         # 长趋势 HPF 数据上 RevIN 把 5 个 Transformer 系列 MAPE 从 6-20% 降到 ~0.5%.
     }
 

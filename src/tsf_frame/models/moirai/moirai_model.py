@@ -133,7 +133,7 @@ class PretrainedMoiraiModel(BaseModel):
                 mean_pred = f.mean  # (pred_len, features) 或 (pred_len,)
                 if mean_pred.ndim == 2:
                     # 我们框架预期返回单步或者多步的 target (默认最后一列或者指定列)
-                    target_idx = self.config.get('revin_target_channel', 0)
+                    target_idx = self.config.get('target_idx', 0)
                     mean_pred = mean_pred[:, target_idx]
                 preds.append(mean_pred)
                 
@@ -183,7 +183,7 @@ class PretrainedMoiraiModel(BaseModel):
                 upper_pred = f.quantile(quantiles[1])
                 
                 if mean_pred.ndim == 2:
-                    target_idx = self.config.get('revin_target_channel', 0)
+                    target_idx = self.config.get('target_idx', 0)
                     mean_pred = mean_pred[:, target_idx]
                     lower_pred = lower_pred[:, target_idx]
                     upper_pred = upper_pred[:, target_idx]
