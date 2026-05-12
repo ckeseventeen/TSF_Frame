@@ -13,14 +13,20 @@
 import pandas as pd
 import numpy as np
 from typing import Dict, Any, Tuple, List, Optional
+import logging
 
 from .base_adapter import BaseBusinessAdapter
 # 全项目 MAPE 收口在 MetricsCalculator (eps 保护 + 小数形式),
 # 这里复用而不是重写, 避免三处 MAPE 计算逻辑分歧.
 from ..utils.metrics import MetricsCalculator
+logger = logging.getLogger(__name__)
 
 
 class HPFAdapter(BaseBusinessAdapter):
+    """Housing Provident Fund (HPF) business adapter.
+
+    Note: This class is **not thread‑safe**; each instance should be used by a single thread.
+    """
     """
     公积金业务适配器，提供:
       - preprocess: 异常值处理 + 归一化
@@ -82,6 +88,11 @@ get_policy_adjusted_forecast（政策模拟）
         # / Whether fit_preprocess has been called
         self._is_fitted: bool = False
 
+# Validate NON_NEGATIVE_COLS are subset of target_columns
+missing_non_neg = set(self.NON_NEGATIVE_COLS) - set(self.target_columns)
+if missing_non_neg:
+    raise ValueError(f"NON_NEGATIVE_COLS {missing_non_neg} not found in target_columns")
+
     # ── 预处理 ───────────────────────────────────────────────────────────────
 
     def preprocess(
@@ -123,6 +134,9 @@ get_policy_adjusted_forecast（政策模拟）
             )
 
         data = data.copy()
+        # Ensure deterministic order for outlier handling
+        if not data.index.is_monotonic_increasing:
+            data = data.sort_index()
         metadata: Dict[str, Any] = {
             'original_columns': data.columns.tolist(),
             'normalization': self.normalization,
@@ -131,12 +145,14 @@ get_policy_adjusted_forecast（政策模拟）
         }
 
         if self.handle_outliers:
+            logger.debug("Handling outliers for columns: %s", self.target_columns)
             # 异常值处理只用当前数据自身的分布 (IQR / 3σ),
             # 这是局部插值, 不会跨 train/test 泄露统计量.
             data, outliers_info = self._handle_outliers(data)
             metadata['outliers_info'] = outliers_info
 
         if fit:
+            logger.debug("Fitting scalers on training data")
             # 训练阶段: 重新学 scaler 并保存
             data = self._normalize(data, metadata)
             self._is_fitted = True
@@ -273,6 +289,11 @@ get_policy_adjusted_forecast（政策模拟）
     # ── 后处理 ───────────────────────────────────────────────────────────────
 
     def postprocess(self, predictions: np.ndarray, metadata: Dict[str, Any], **kwargs) -> pd.DataFrame:
+        """Postprocess predictions: denormalize and enforce non‑negative constraints.
+
+        Logging added for debugging the steps.
+        """
+        logger.debug("Starting postprocess with predictions shape %s", predictions.shape)
         """
         公积金数据后处理 / HPF data postprocessing
 
@@ -296,6 +317,7 @@ get_policy_adjusted_forecast（政策模拟）
             if col in self.NON_NEGATIVE_COLS:
                 pred_df[col] = pred_df[col].clip(lower=0)
 
+        logger.debug("Postprocess completed, returning DataFrame with columns %s", pred_df.columns.tolist())
         return pred_df
 
     # ── 数据校验 ─────────────────────────────────────────────────────────────
@@ -446,49 +468,29 @@ get_policy_adjusted_forecast（政策模拟）
     def get_seasonal_decomposition(
         self, data: pd.Series, period: int = 12
     ) -> Dict[str, pd.Series]:
+        """Simple additive seasonal decomposition.
+
+        Returns a dict with ``trend``, ``seasonal`` and ``residual`` components.
         """
-        简单季节分解（加法模型） / Simple seasonal decomposition (additive model)
-
-        适用于月度公积金数据的趋势/季节/残差分析。
-        Suitable for trend/seasonal/residual analysis of monthly HPF data.
-
-        加法模型: Y = Trend + Seasonal + Residual
-        Additive model: Y = Trend + Seasonal + Residual
-
-        Args:
-            data: 时间序列数据 / Time series data
-            period: 季节周期（默认12个月） / Seasonal period (default 12 months)
-
-        Returns:
-            包含 trend、seasonal、residual 三个分量的字典
-            Dict with trend, seasonal, and residual components
-        """
-        # 第一步：用居中移动平均提取趋势分量
-        # Step 1: Extract trend component via centered moving average
+        # Ensure data is sorted by index for correct rolling calculations
+        if not data.index.is_monotonic_increasing:
+            data = data.sort_index()
+        # Trend via centered moving average
         trend = data.rolling(window=period, center=True, min_periods=1).mean()
-
-        # 第二步：去趋势得到季节+残差的混合信号
-        # Step 2: Remove trend to get seasonal + residual mixed signal
+        # Remove trend to obtain seasonal + residual signal
         seasonal_raw = data - trend
-
-        # 第三步：按月（或按周期位置）计算季节性均值
-        # Step 3: Compute seasonal mean by month (or by position in cycle)
+        # Determine seasonal index based on datetime month or positional period
         if isinstance(data.index, pd.DatetimeIndex):
-            seasonal_index = data.index.month
+            seasonal_idx = data.index.month
         else:
-            seasonal_index = np.arange(len(data)) % period
-        seasonal_mean = pd.Series(dtype=float)
-        for s in np.unique(seasonal_index):
-            seasonal_mean[s] = seasonal_raw[seasonal_index == s].mean()
-
-        # 第四步：用季节性均值构造完整的季节分量
-        # Step 4: Build the full seasonal component from seasonal means
+            seasonal_idx = np.arange(len(data)) % period
+        # Compute seasonal means using groupby for efficiency
+        seasonal_means = pd.Series(seasonal_raw.values, index=seasonal_idx).groupby(level=0).mean()
+        # Map back to full seasonal series
         seasonal = pd.Series(
-            [float(seasonal_mean.get(s, 0)) for s in seasonal_index],
+            seasonal_idx.map(seasonal_means).values,
             index=data.index
         )
-
-        # 第五步：残差 = 原始数据 - 趋势 - 季节
-        # Step 5: Residual = Original - Trend - Seasonal
+        # Residual component
         residual = data - trend - seasonal
         return {'trend': trend, 'seasonal': seasonal, 'residual': residual}
