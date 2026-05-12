@@ -173,6 +173,40 @@ print(status.alert_level, status.recommendations)
 - 版本 0.2.0 · 测试 **54 passed**
 - HPF baseline (Ridge): MAPE ~1% · R² ~0.99 (12 年模拟月度数据)
 
+## Moirai 零样本大模型 (Zero-Shot Foundation Model)
+
+**Moirai** 是由 Salesforce AI Research 提出的大型时间序列预测基础模型。它基于掩码编码器（Masked Encoder）架构，并在海量数据集 (LOTSA data) 上进行了预训练，拥有极其强大的开箱即用能力。
+
+* **论文参考**: [Unified Training of Universal Time Series Forecasting Transformers](https://arxiv.org/abs/2402.02592) (Woo et al., 2024)
+
+### 架构与原生概率预测
+不同于传统的深度学习模型输出单点预测，Moirai 是一个**天然的概率预测模型**。它的最后一层会输出一个混合概率分布（Mixture Distribution）。
+在 `TSF_Frame` 框架中，我们对其进行了深度集成封装（见 `PretrainedMoiraiModel`）：
+- **跳过残差训练**：不再依赖 `BaseModel` 笨拙的静态残差计算。
+- **动态置信区间**：直接通过 `probabilistic_predict` 接口提取 Moirai 基于上下文动态生成的 10% 和 90% 分位数（Quantiles）。
+- **完全零样本**：整个过程无需反向传播（Zero-shot），即插即用。
+
+### 核心家族与参数量
+| 模型名称 | 参数量 | HuggingFace 仓库 | TSF_Frame 配置项 |
+| :---: | :---: | :---: | :---: |
+| Moirai-1.0-R-Small | 14M | [Salesforce/moirai-1.0-R-small](https://huggingface.co/Salesforce/moirai-1.0-R-small) | `'moirai_size': 'small'` |
+| Moirai-1.0-R-Base | 91M | [Salesforce/moirai-1.0-R-base](https://huggingface.co/Salesforce/moirai-1.0-R-base) | `'moirai_size': 'base'` |
+| Moirai-1.0-R-Large | 311M | [Salesforce/moirai-1.0-R-large](https://huggingface.co/Salesforce/moirai-1.0-R-large) | `'moirai_size': 'large'` |
+
+> 💡 **权重缓存机制**: 框架已配置本地缓存。首次运行时模型将被自动下载并缓存在项目根目录的 `pretrained_models/` 文件夹下，不再占用系统 C 盘空间。
+
+### 运行示例
+使用 Moirai 前，请确保你的 Python 版本 >= 3.10，并安装了最新的依赖（见 `requirements.txt`）：
+```bash
+pip install uni2ts>=2.0.0 gluonts>=0.14.0 safetensors
+```
+运行完整的业务演示脚本：
+```bash
+python pipelines/examples/hpf_moirai_zeroshot_example.py
+```
+
+---
+
 ## License
 
 MIT
