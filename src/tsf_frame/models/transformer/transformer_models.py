@@ -8,8 +8,8 @@ and _mc_dropout_predict for MC Dropout probabilistic prediction.
 
   - LSTMModel       : LSTM，含独立 Dropout 层以支持 MC Dropout / LSTM with standalone Dropout for MC Dropout
   - TransformerModel: 标准 Transformer Encoder / Standard Transformer Encoder
-  - Autoformer      : NeurIPS 2021，序列分解 + FFT 自相关注意力 / Series decomposition + FFT auto-correlation
-  - iTransformer    : ICLR 2024，逆向 Transformer，变量维度注意力 / Inverted Transformer, variate-wise attention
+  - AutoFormer      : NeurIPS 2021，序列分解 + FFT 自相关注意力 / Series decomposition + FFT auto-correlation
+  - iTransFormer    : ICLR 2024，逆向 Transformer，变量维度注意力 / Inverted Transformer, variate-wise attention
   - TimesNet        : ICLR 2023，1D→2D 时序建模 + 多尺度卷积 / 1D-to-2D temporal modeling + multi-scale convolution
 """
 import math
