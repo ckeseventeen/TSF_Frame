@@ -72,18 +72,13 @@ class PretrainedMoiraiModel(BaseModel):
 
     def fit(self, train_data: Any, val_data: Optional[Any] = None, **kwargs) -> Dict[str, Any]:
         """
-        零样本模型无需训练，此处的 fit 仅用于对训练集做一次 inference，
-        从而获取残差，供后续 probabilistic_predict 使用。
+        零样本模型无需训练。并且由于我们重写了 probabilistic_predict 使用 Moirai 原生概率分布，
+        此处不再需要计算残差，直接标记为已训练即可。
         """
         if not self._has_uni2ts:
             raise RuntimeError("Missing uni2ts library.")
             
-        X_train, y_train = train_data
-        # 预估并记录残差
-        y_pred = self.predict(X_train)
-        # 用 BaseModel 自带的 _fit_residuals
-        self._fit_residuals(y_true=y_train, y_pred=y_pred, source='train')
-        
+        self._is_fitted = True
         return {'train_loss': [0.0], 'val_loss': [0.0]}
 
     def predict(self, test_data: Any, **kwargs) -> np.ndarray:
@@ -145,6 +140,63 @@ class PretrainedMoiraiModel(BaseModel):
         # 结果拼接为 (N, pred_len) 或 (N, 1)
         y_pred = np.array(preds) 
         return y_pred
+
+    def probabilistic_predict(self, X_test: Any, quantiles: list = [0.1, 0.9], **kwargs) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        重写 BaseModel 的 probabilistic_predict，直接提取 Moirai 原生的概率分布分位数，
+        不再依赖残差计算。
+        """
+        if not self._has_uni2ts:
+            raise RuntimeError("Missing uni2ts library. Cannot predict.")
+            
+        N, seq_len, num_features = X_test.shape
+        pred_len = self.config.get('pred_len', 1)
+        
+        preds_mean, preds_lower, preds_upper = [], [], []
+        
+        self.pretrained_model.eval()
+        with torch.no_grad():
+            from gluonts.dataset.common import ListDataset
+            import pandas as pd
+            
+            ds_list = []
+            for i in range(N):
+                target = X_test[i].T
+                if num_features == 1:
+                    target = target.flatten()
+                
+                ds_list.append({
+                    "start": pd.Timestamp("2000-01-01"),
+                    "target": target
+                })
+            dataset = ListDataset(ds_list, freq="M", one_dim_target=(num_features==1))
+            
+            self.pretrained_model.prediction_length = pred_len
+            predictor = self.pretrained_model.create_predictor(batch_size=self.config.get('batch_size', 16))
+            
+            forecasts = list(predictor.predict(dataset))
+            
+            for f in forecasts:
+                mean_pred = f.mean
+                # 提取用户指定的分位数
+                lower_pred = f.quantile(quantiles[0])
+                upper_pred = f.quantile(quantiles[1])
+                
+                if mean_pred.ndim == 2:
+                    target_idx = self.config.get('revin_target_channel', 0)
+                    mean_pred = mean_pred[:, target_idx]
+                    lower_pred = lower_pred[:, target_idx]
+                    upper_pred = upper_pred[:, target_idx]
+                    
+                preds_mean.append(mean_pred)
+                preds_lower.append(lower_pred)
+                preds_upper.append(upper_pred)
+                
+        y_pred = np.array(preds_mean)
+        y_lower = np.array(preds_lower)
+        y_upper = np.array(preds_upper)
+        
+        return y_pred, y_lower, y_upper
 
 
 class PatchEmbedding(nn.Module):

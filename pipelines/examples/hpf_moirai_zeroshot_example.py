@@ -71,14 +71,14 @@ def generate_hpf_data(years: int = 20, start_year: int = 2012) -> pd.DataFrame:
 # ─── 2. 可视化辅助函数 ────────────────────────────────────────────────────────
 _PLOTTER = PredictionPlotter(figsize=(14, 10), dpi=120)
 
-def plot_forecast_comparison(y_true, y_pred, dates, target_col, save_path):
+def plot_forecast_comparison(y_true, y_pred, y_lower, y_upper, dates, target_col, save_path):
     models_pred = {
         'Moirai Zero-shot': y_pred
     }
     _PLOTTER.forecast_comparison_fig(
         x=dates, y_true=y_true,
         models_pred=models_pred,
-        best_interval=None,
+        best_interval=(y_pred, y_lower, y_upper) if y_lower is not None else None,
         target_label=f'{target_col} Moirai预测', ylabel='亿元',
         save_path=save_path,
     )
@@ -150,28 +150,35 @@ def main():
     
     model = get_moirai_model('moirai_zeroshot', moirai_config)
     
-    logger.info('[Step 4] 运行 fit() 计算残差 (不进行反向传播)...')
+    logger.info('[Step 4] 模型已在内部跳过 fit() (因使用了 Moirai 原生概率预测)...')
     model.fit((X_train, y_train))
     
-    logger.info('[Step 5] 运行 predict() 零样本预测...')
-    y_pred_raw = model.predict(X_test)
+    logger.info('[Step 5] 运行 probabilistic_predict() 提取原生概率分布分位数 (P10~P90)...')
+    y_pred_raw, y_lower_raw, y_upper_raw = model.probabilistic_predict(X_test, quantiles=[0.1, 0.9])
+    
     y_pred = y_pred_raw.flatten()
+    y_lower = y_lower_raw.flatten()
+    y_upper = y_upper_raw.flatten()
 
     # 反归一化评估
     logger.info('\n[Step 6] 业务评估与可视化...')
     y_test_df = pd.DataFrame(y_test.flatten().reshape(-1, 1), columns=[target_col], index=test_dates)
     y_pred_df = pd.DataFrame(y_pred.reshape(-1, 1), columns=[target_col], index=test_dates)
+    y_lower_df = pd.DataFrame(y_lower.reshape(-1, 1), columns=[target_col], index=test_dates)
+    y_upper_df = pd.DataFrame(y_upper.reshape(-1, 1), columns=[target_col], index=test_dates)
     
     y_test_orig = adapter._denormalize(y_test_df, metadata)[target_col].values
     y_pred_orig = adapter._denormalize(y_pred_df, metadata)[target_col].values
+    y_lower_orig = adapter._denormalize(y_lower_df, metadata)[target_col].values
+    y_upper_orig = adapter._denormalize(y_upper_df, metadata)[target_col].values
     
     metrics = MetricsCalculator.calculate_all(y_test_orig, y_pred_orig)
     logger.info(f'  MAE={metrics["MAE"]:.4f}  MAPE={metrics["MAPE"]:.2%}  R2={metrics["R2"]:.4f}')
 
     # 保存图表
     save_path = os.path.join(output_dir, 'hpf_moirai_zeroshot_forecast.png')
-    plot_forecast_comparison(y_test_orig, y_pred_orig, test_dates, target_col, save_path)
-    logger.info(f'预测图表已保存至: {save_path}')
+    plot_forecast_comparison(y_test_orig, y_pred_orig, y_lower_orig, y_upper_orig, test_dates, target_col, save_path)
+    logger.info(f'带有 10%~90% 分位数置信区间的预测图表已保存至: {save_path}')
 
 if __name__ == '__main__':
     main()
