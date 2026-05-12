@@ -16,3 +16,7 @@ xgboost>=1.5.0
 lightgbm>=3.3.0
 catboost>=1.0.0
 u8darts>=0.26.0
+
+# Foundation Models & Zero-Shot Forecasting (Requires Python >= 3.10)
+uni2ts>=2.0.0
+gluonts>=0.14.0

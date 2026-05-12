@@ -14,7 +14,7 @@
       <excludeFolder url="file://$MODULE_DIR$/src/tsf_frame.egg-info" />
       <excludeFolder url="file://$MODULE_DIR$/tsf_frame.egg-info" />
     </content>
-    <orderEntry type="jdk" jdkName="tsf_env" jdkType="Python SDK" />
+    <orderEntry type="jdk" jdkName="C:\Users\lzxso\anaconda3\envs\tsf_env" jdkType="Python SDK" />
     <orderEntry type="sourceFolder" forTests="false" />
   </component>
   <component name="PyDocumentationSettings">

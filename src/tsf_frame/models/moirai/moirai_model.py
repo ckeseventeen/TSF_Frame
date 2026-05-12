@@ -11,6 +11,121 @@ from ..base_model import BaseModel, ProbabilisticPrediction
 from ..transformer.transformer_models import _DLBaseModel
 
 
+class PretrainedMoiraiModel(BaseModel):
+    """
+    基于 Salesforce 官方 uni2ts 库的预训练 Moirai 零样本模型.
+    
+    采用 Wrapper 设计模式:
+    - 兼容 BaseModel 的 fit / predict 接口.
+    - fit() 函数不进行反向传播, 仅用来计算残差以兼容框架的经验置信区间.
+    - predict() 自动进行 tensor 转换并调用官方预训练权重进行 Zero-shot 推理.
+    """
+    def __init__(self, config: Dict[str, Any]):
+        super().__init__(config)
+        self.model_name = 'moirai_zeroshot'
+        self.size = config.get('moirai_size', 'small')  # 'small', 'base', 'large'
+        
+        try:
+            from uni2ts.model.moirai import MoiraiForecast
+            # 首次运行会自动从 HuggingFace 下载对应权重的 checkpoint
+            # 建议全局代理或提前通过 HF_ENDPOINT 镜像下载
+            self.pretrained_model = MoiraiForecast.load_from_checkpoint(
+                f"Salesforce/moirai-1.0-R-{self.size}",
+                module_kwargs={'min_patches': 2, 'min_mask_ratio': 0.15, 'max_mask_ratio': 0.5, 'multi_dim': True}
+            )
+            self.pretrained_model.to(self.device)
+            # MoiraiForecast 返回的是分布预测器
+            self.predictor = self.pretrained_model.create_predictor(batch_size=config.get('batch_size', 16))
+            self._has_uni2ts = True
+        except ImportError:
+            self.pretrained_model = None
+            self._has_uni2ts = False
+            import logging
+            logging.getLogger(__name__).warning(
+                "无法导入 'uni2ts' 库，Moirai 零样本模型将无法工作。"
+                "请运行: pip install uni2ts"
+            )
+            
+    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+        """BaseModel 要求实现 forward，零样本 Wrapper 直接透传官方调用."""
+        if not self._has_uni2ts:
+            raise RuntimeError("Missing uni2ts library.")
+        return self.pretrained_model(x)
+
+    def fit(self, train_data: Any, val_data: Optional[Any] = None, **kwargs) -> Dict[str, Any]:
+        """
+        零样本模型无需训练，此处的 fit 仅用于对训练集做一次 inference，
+        从而获取残差，供后续 probabilistic_predict 使用。
+        """
+        if not self._has_uni2ts:
+            raise RuntimeError("Missing uni2ts library.")
+            
+        X_train, y_train = train_data
+        # 预估并记录残差
+        y_pred = self.predict(X_train)
+        # 用 BaseModel 自带的 _fit_residuals
+        self._fit_residuals(y_true=y_train, y_pred=y_pred, source='train')
+        
+        return {'train_loss': [0.0], 'val_loss': [0.0]}
+
+    def predict(self, test_data: Any, **kwargs) -> np.ndarray:
+        """将 3D numpy array 输入转为 Moirai 所需格式进行零样本推理."""
+        if not self._has_uni2ts:
+            raise RuntimeError("Missing uni2ts library. Cannot predict.")
+            
+        X_test = test_data  # 期望 shape: (N, seq_len, features)
+        N, seq_len, num_features = X_test.shape
+        pred_len = self.config.get('pred_len', 1)
+        
+        preds = []
+        # uni2ts 需要特别的数据迭代器或者直接通过内部模块调用，这里我们提供一个张量直接推理的简化实现
+        # 注意: 官方 MoiraiForecast 推理通常需要传入 GluonTS 格式的 dataset
+        # 为了兼容 Numpy, 我们直接提取其内部的 pytorch 模型调用逻辑
+        self.pretrained_model.eval()
+        with torch.no_grad():
+            tensor_x = torch.tensor(X_test, dtype=torch.float32).to(self.device)
+            # Moirai 输入通常需要 past_target, past_observed_values 等
+            # 这里为适应 TSF_Frame 给出通用封装:
+            # (官方接口较为复杂，此处提供简化张量推理，若使用 predictor 则需要构造 GluonTS ListDataset)
+            # 针对张量：如果模型是 Module, 我们用内部方法. Moirai 默认处理一维时间序列(多变量需 flattening 或独立)
+            
+            # 简化版：使用 GluonTS ListDataset 兼容官方 predictor
+            from gluonts.dataset.common import ListDataset
+            import pandas as pd
+            
+            # 将 (N, seq_len, features) 转化为 N 个独立的 time series dict
+            ds_list = []
+            for i in range(N):
+                # GluonTS expects shape (features, seq_len)
+                target = X_test[i].T
+                ds_list.append({
+                    "start": pd.Timestamp("2000-01-01"), # 任意起始时间
+                    "target": target
+                })
+            dataset = ListDataset(ds_list, freq="M", one_dim_target=False)
+            
+            # 覆盖 prediction_length
+            self.pretrained_model.prediction_length = pred_len
+            predictor = self.pretrained_model.create_predictor(batch_size=self.config.get('batch_size', 16))
+            
+            # 推理得到分布预测对象列表
+            forecasts = list(predictor.predict(dataset))
+            
+            # 取 mean (shape: [pred_len, features])
+            for f in forecasts:
+                # 若是多变量，取平均或指定 target
+                mean_pred = f.mean  # (pred_len, features) 或 (pred_len,)
+                if mean_pred.ndim == 2:
+                    # 我们框架预期返回单步或者多步的 target (默认最后一列或者指定列)
+                    target_idx = self.config.get('revin_target_channel', 0)
+                    mean_pred = mean_pred[:, target_idx]
+                preds.append(mean_pred)
+                
+        # 结果拼接为 (N, pred_len) 或 (N, 1)
+        y_pred = np.array(preds) 
+        return y_pred
+
+
 class PatchEmbedding(nn.Module):
     def __init__(self, input_size: int, d_model: int, patch_size: int):
         super().__init__()
@@ -170,7 +285,8 @@ class MoiraiModel(_DLBaseModel):
 
 
 MOIRAI_REGISTRY = {
-    'moirai': MoiraiModel
+    'moirai': MoiraiModel,
+    'moirai_zeroshot': PretrainedMoiraiModel
 }
 
 
@@ -178,3 +294,4 @@ def get_moirai_model(model_name: str, config: Dict[str, Any]) -> BaseModel:
     if model_name not in MOIRAI_REGISTRY:
         raise ValueError(f"Model '{model_name}' not found. Available models: {list(MOIRAI_REGISTRY.keys())}")
     return MOIRAI_REGISTRY[model_name](config)
+
