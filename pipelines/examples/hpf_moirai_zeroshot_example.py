@@ -35,7 +35,7 @@ import pandas as pd
 import torch
 import matplotlib
 matplotlib.use('Agg')
-import matplotlib.pyplot as plt
+
 
 from tsf_frame.visualization import PredictionPlotter
 from configs.hpf.hpf_config import HPFConfig
