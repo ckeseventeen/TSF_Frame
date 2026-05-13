@@ -60,7 +60,7 @@ from tsf_frame.models.base_model import ProbabilisticPrediction
 # 与 hpf_example.py 完全一致,确保两个示例可直接对比
 # Identical to hpf_example.py so both examples can be compared directly.
 
-def generate_hpf_data(years: int = 50, start_year: int = 2012) -> pd.DataFrame:
+def generate_hpf_data(years: int = 20, start_year: int = 2012) -> pd.DataFrame:
     """
     生成模拟月度公积金数据,包含:
       - 长期增长趋势(政策驱动)

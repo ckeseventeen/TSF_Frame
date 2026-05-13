@@ -49,7 +49,7 @@ from tsf_frame.models.moirai.moirai_model import get_moirai_model
 from tsf_frame.models.base_model import ProbabilisticPrediction
 
 # ─── 1. 数据生成 ──────────────────────────────────────────────────────────────
-def generate_hpf_data(years: int = 20, start_year: int = 2012) -> pd.DataFrame:
+def generate_hpf_data(years: int = 40, start_year: int = 2012) -> pd.DataFrame:
     np.random.seed(42)
     n_months = years * 12
     dates = pd.date_range(start=f'{start_year}-01-01', periods=n_months, freq='MS')
