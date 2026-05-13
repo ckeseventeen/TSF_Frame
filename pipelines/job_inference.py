@@ -57,6 +57,13 @@ def run_future_forecast(recent_df, config, model_path, adapter, meta=None):
     use_diff = diff_flag['use_diff']
 
     # 3. 业务预处理 (只 Transform, 复用训练时学到的 scaler)
+    #    🔴 若 adapter 是新实例 (典型场景: 月度跑批只推理, 不重训),
+    #    _is_fitted=False, 必须先从 meta 把训练期 scaler 灌回去, 否则
+    #    fit=False 会 raise RuntimeError.
+    if not adapter._is_fitted and meta.get('scalers'):
+        adapter._scalers = dict(meta['scalers'])
+        adapter._is_fitted = True
+        logger.info(f"Restored {len(meta['scalers'])} scalers from meta to adapter")
     processed_df, _ = adapter.preprocess(recent_df, fit=False)
 
     # 4. 初始化特征工程
