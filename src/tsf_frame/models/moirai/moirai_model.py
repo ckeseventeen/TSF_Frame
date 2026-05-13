@@ -36,8 +36,16 @@ class PretrainedMoiraiModel(BaseModel):
             # 如果你有 covariates，需要修改 feat_dynamic_real_dim
             features_dim = config.get('num_features', 1) 
             
-            # 将模型权重下载并缓存到项目目录下的 pretrained_models 文件夹中
-            cache_dir = os.path.join(os.getcwd(), 'pretrained_models')
+            # 将模型权重下载并缓存到项目根目录下的 pretrained_models 文件夹中
+            # 🔴 修复: 使用 __file__ 锚定项目根, 而非 os.getcwd()
+            # 旧代码用 CWD, 从不同目录运行会导致权重被重复下载到多个位置
+            # / Fixed: anchor to project root via __file__, not CWD.
+            #   Old code used getcwd(), causing duplicate downloads when run
+            #   from different directories (e.g. pipelines/examples/).
+            _moirai_file = os.path.abspath(__file__)
+            _project_root = os.path.dirname(os.path.dirname(os.path.dirname(
+                os.path.dirname(_moirai_file))))  # src/tsf_frame/models/moirai → root
+            cache_dir = os.path.join(_project_root, 'pretrained_models')
             os.makedirs(cache_dir, exist_ok=True)
             
             self.pretrained_model = MoiraiForecast(
