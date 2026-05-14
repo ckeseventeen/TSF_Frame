@@ -21,7 +21,8 @@ import sys
 import warnings
 warnings.filterwarnings('ignore')
 
-from pathlib import Path as _Path
+from pathlib import Path as _Path, Path
+
 _HERE = _Path(__file__).resolve()
 for _p in (_HERE.parent, *_HERE.parents):
     if (_p / 'configs').is_dir() and (_p / 'src').is_dir():
@@ -89,7 +90,7 @@ def main():
     torch.manual_seed(42)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    project_root = Path(__file__).resolve().parent.parent.parent
     output_dir = os.path.join(project_root, 'logs', 'outputs', 'hpf_moirai')
     os.makedirs(output_dir, exist_ok=True)
 
@@ -141,7 +142,7 @@ def main():
     # 实例化并运行 Moirai 零样本模型
     logger.info('\n[Step 3] 加载 Moirai 零样本预训练模型 (初次运行可能需要下载权重)...')
     moirai_config = {
-        'moirai_size': 'small', # 可选 small, base, large
+        'moirai_size': 'base', # 可选 small, base, large
         'batch_size': 16,
         'pred_len': pred_len,
         'device': device,
