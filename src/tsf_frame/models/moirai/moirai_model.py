@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Any, Optional, Tuple
 import numpy as np
-
+from pathlib import Path
 from ..base_model import BaseModel, ProbabilisticPrediction
 # 复用 transformer_models 的训练循环 + MC Dropout 推理, 避免重复造轮子.
 # 此前 MoiraiModel 自己写了一份 fit/_predict_probabilistic, 与 _dl_fit /
@@ -34,20 +34,11 @@ class PretrainedMoiraiModel(BaseModel):
             seq_len = config.get('seq_len', 24)
             # 默认假设输入的列全是预测目标列 (multi_dim)
             # 如果你有 covariates，需要修改 feat_dynamic_real_dim
-            features_dim = config.get('num_features', 1) 
-            
-            # 将模型权重下载并缓存到项目根目录下的 pretrained_models 文件夹中
-            # 🔴 修复: 使用 __file__ 锚定项目根, 而非 os.getcwd()
-            # 旧代码用 CWD, 从不同目录运行会导致权重被重复下载到多个位置
-            # / Fixed: anchor to project root via __file__, not CWD.
-            #   Old code used getcwd(), causing duplicate downloads when run
-            #   from different directories (e.g. pipelines/examples/).
-            _moirai_file = os.path.abspath(__file__)
-            _project_root = os.path.dirname(os.path.dirname(os.path.dirname(
-                os.path.dirname(_moirai_file))))  # src/tsf_frame/models/moirai → root
+            features_dim = config.get('num_features', 1)
+            # resolve() 可以把路径转为绝对路径，避免相对路径带来的干扰
+            _project_root = Path(__file__).resolve().parent.parent.parent.parent.parent
             cache_dir = os.path.join(_project_root, 'pretrained_models')
             os.makedirs(cache_dir, exist_ok=True)
-            
             self.pretrained_model = MoiraiForecast(
                 module=MoiraiModule.from_pretrained(repo_id, cache_dir=cache_dir),
                 prediction_length=pred_len,

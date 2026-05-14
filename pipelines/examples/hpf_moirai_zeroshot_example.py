@@ -46,7 +46,7 @@ from tsf_frame.utils.logger import get_logger
 
 # 导入 moirai 模型工厂函数
 from tsf_frame.models.moirai.moirai_model import get_moirai_model
-from tsf_frame.models.base_model import ProbabilisticPrediction
+
 
 # ─── 1. 数据生成 ──────────────────────────────────────────────────────────────
 def generate_hpf_data(years: int = 40, start_year: int = 2012) -> pd.DataFrame:
