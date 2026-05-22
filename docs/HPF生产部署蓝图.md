@@ -2,6 +2,13 @@
 
 > **目标:** 在 `TSF_Frame` 之上,落地 **20 个公积金业务预测需求**,每个需求多个指标。
 > 跑得起来 → 监控起来 → 运维起来。**不含前端看板**(纯后台批处理 + 监控审计)。
+>
+> **当前框架实现说明**:本蓝图是项目化设计提案。当前 TSF_Frame 已实装的最小骨架是
+> `configs/hpf/task_registry.py` `TASKS[]` + `configs/hpf/sql_templates/*.sql` +
+> `pipelines/run_monthly_controller.py`(月度跑批主控)。SQL 走 **双模板约定**:
+> `sql_path` 拉训练全量(如 -60 个月)、`sql_infer_path` 拉推理短窗口(如 -24 个月);
+> `sql_infer_path` 可省,省则训推共用一份 SQL。下文 Step 3 的 `data_loader.py` 写法
+> 是项目化方案,实际落地可直接走当前的双 SQL 约定。
 
 ---
 

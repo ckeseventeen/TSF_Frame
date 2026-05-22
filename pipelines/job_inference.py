@@ -80,10 +80,18 @@ def run_future_forecast(recent_df, config, model_path, adapter, meta=None):
     current_buffer = processed_df.copy()
     future_preds_norm = []  # 归一化空间的预测值
 
+    # 显式 fit engineer 一次, 后续循环统一走 transform — 严格遵循 fit/transform 因果原则.
+    # 当前 4 个内建 engineer (Time/Lag/Rolling/Difference) 的 .fit() 是 stateless no-op,
+    # 所以这里 fit + 循环 transform 与"循环 fit_transform"功能等价;
+    # 但加任何带统计量的 engineer (StandardScalerEngineer 等) 后,
+    # fit_transform 在循环里会泄露后续步骤的统计信息 → 真数据泄露 bug.
+    # / Explicit fit-once + transform-many for strict fit/transform separation.
+    engineer.fit(current_buffer)
+
     # 差分模式: 需要一个"锚点" (最后已知的水平值) 用于累加还原
     if use_diff:
         # 用当前 buffer 末尾的归一化值作为锚点
-        df_init = engineer.fit_transform(current_buffer).dropna()
+        df_init = engineer.transform(current_buffer).dropna()
         anchor = df_init[target_col].iloc[-1]
         logger.info(f"DiffTransform enabled. Anchor = {anchor:.4f}")
     else:
@@ -92,8 +100,8 @@ def run_future_forecast(recent_df, config, model_path, adapter, meta=None):
     logger.info(f"Starting autoregressive forecast for {pred_len} steps (diff={use_diff})")
 
     for i in range(pred_len):
-        # A. 重建特征
-        df_feat = engineer.fit_transform(current_buffer)
+        # A. 重建特征 (transform-only; engineer 状态已经在循环外 fit 过)
+        df_feat = engineer.transform(current_buffer)
         feature_cols = [c for c in df_feat.columns if c != target_col]
         X_last = df_feat[feature_cols].tail(1).values
 

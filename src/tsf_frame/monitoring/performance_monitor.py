@@ -362,10 +362,15 @@ class PerformanceMonitor:
 
         向后兼容: 若传入 ``int``, 视为旧的位置索引接口, 发出
         ``DeprecationWarning`` 并退化为按插入顺序的第 N 条 (不保证正确)。
+
+        .. deprecated:: 0.2.0
+           位置索引路径在窗口满 + 真值乱序到达时会错位, 已被弃用.
+           **计划 0.3.0 移除**, 届时只接受 datetime 类型的 target_ts.
+           调用方现在就应改用 ``fill_actual(target_ts=<datetime>, y_true=...)``.
         """
         if isinstance(target_ts, int):
             warnings.warn(
-                'fill_actual(index, y_true) 已废弃; 请用 '
+                'fill_actual(index, y_true) 已废弃 (计划 0.3.0 移除); 请用 '
                 'fill_actual(target_ts=..., y_true=...). '
                 '位置索引在窗口满时会错位.',
                 DeprecationWarning, stacklevel=2,

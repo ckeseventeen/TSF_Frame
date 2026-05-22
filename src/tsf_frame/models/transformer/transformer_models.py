@@ -16,7 +16,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, List, Optional, Sequence, Tuple, Union
 import numpy as np
 
 from ..base_model import BaseModel, ProbabilisticPrediction
@@ -222,6 +222,12 @@ def _dl_fit(model: 'BaseModel', train_data, val_data, config: dict) -> dict:
     batch_size = config.get('batch_size', 32)
     device = config.get('device', 'cpu')
 
+    # 早停 / 学习率调度 — 默认全关 (向后兼容)
+    # / Optional early stopping + LR scheduling (default off for backward compat)
+    patience: int = int(config.get('early_stop_patience', 0))   # 0 = 不开
+    min_delta: float = float(config.get('early_stop_min_delta', 0.0))
+    scheduler_type: Optional[str] = config.get('lr_scheduler', None)  # None / 'plateau' / 'cosine'
+
     X_train, y_train = train_data
     X_train = torch.FloatTensor(X_train).to(device)
     y_train = torch.FloatTensor(y_train).to(device)
@@ -235,6 +241,32 @@ def _dl_fit(model: 'BaseModel', train_data, val_data, config: dict) -> dict:
         X_val, y_val = val_data
         X_val_t = torch.FloatTensor(X_val).to(device)
         y_val_t = torch.FloatTensor(y_val).to(device)
+
+    # ── 构造 LR scheduler (val_data 缺失时 'plateau' 退化为 None) ──
+    scheduler = None
+    if scheduler_type == 'plateau' and X_val_t is not None:
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            model.optimizer, mode='min',
+            factor=float(config.get('lr_factor', 0.5)),
+            patience=int(config.get('lr_plateau_patience', 5)),
+        )
+    elif scheduler_type == 'cosine':
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            model.optimizer, T_max=epochs,
+        )
+    elif scheduler_type is not None and scheduler_type not in ('plateau', 'cosine'):
+        import warnings
+        warnings.warn(
+            f"_dl_fit: lr_scheduler={scheduler_type!r} 未识别 (支持 'plateau' / 'cosine'), 已跳过.",
+            UserWarning, stacklevel=2,
+        )
+
+    # ── 早停状态 ──
+    import copy as _copy
+    best_val: float = float('inf')
+    best_state = None
+    bad_epochs: int = 0
+    early_stopped_at: Optional[int] = None
 
     n_train = len(X_train)
     for epoch in range(epochs):
@@ -287,9 +319,39 @@ def _dl_fit(model: 'BaseModel', train_data, val_data, config: dict) -> dict:
             val_loss = val_loss_sum / n_val
             history['val_loss'].append(val_loss)
             print(f'Epoch {epoch+1}/{epochs}  Train: {avg_loss:.4f}  Val: {val_loss:.4f}')
+
+            # LR scheduler.step() — plateau 需要 val_loss, cosine 不需要
+            if scheduler is not None:
+                if scheduler_type == 'plateau':
+                    scheduler.step(val_loss)
+                else:
+                    scheduler.step()
+
+            # 早停: 跟踪 best val_loss + 容差 min_delta, 超过 patience 个 epoch 无改善则停
+            if patience > 0:
+                if val_loss < best_val - min_delta:
+                    best_val = val_loss
+                    best_state = _copy.deepcopy(model.state_dict())
+                    bad_epochs = 0
+                else:
+                    bad_epochs += 1
+                    if bad_epochs >= patience:
+                        early_stopped_at = epoch + 1
+                        # 回滚到 best state, 避免最后几个 epoch 过拟合产物落地
+                        if best_state is not None:
+                            model.load_state_dict(best_state)
+                        print(f'Early stop @ epoch {early_stopped_at} '
+                              f'(best val={best_val:.4f}, patience={patience})')
+                        break
         else:
             print(f'Epoch {epoch+1}/{epochs}  Train: {avg_loss:.4f}')
+            # 无 val 时 cosine 仍可走, plateau 已在构造时被跳过
+            if scheduler is not None and scheduler_type == 'cosine':
+                scheduler.step()
 
+    if early_stopped_at is not None:
+        history['early_stopped_at'] = early_stopped_at
+        history['best_val_loss'] = best_val
     return history
 
 
@@ -444,7 +506,24 @@ class _DLBaseModel(BaseModel):
         # 默认 True: 长趋势数据上是更安全的归一化策略, 短期/平稳序列也无负面
         # / Default to True: safer normalisation for trend-bearing series,
         #   neutral on stationary ones.
-        if self.config.get('use_revin', True):
+        use_revin = self.config.get('use_revin', True)
+
+        # 守卫: use_revin + use_diff 同开会量纲错位 (RevIN 用 X(level) std/mean
+        # 反归一化 Y(diff)), 实测 MAPE 飙到 2000%+. 调用方在传 cfg 给训练循环时
+        # 顺手设 cfg['_train_uses_diff_target'] = True/False 即可触发本守卫.
+        # / Mutex guard: RevIN (X-side, level units) and use_diff (Y-side, delta units)
+        #   are unit-incompatible. Set _train_uses_diff_target in config to surface this.
+        if use_revin and self.config.get('_train_uses_diff_target', False):
+            import warnings
+            warnings.warn(
+                "use_revin=True 与 use_diff=True 同开: RevIN 用 X(level) 量纲的 "
+                "std/mean 反归一化 Y(diff), 量纲错位会让 MAPE 飙到 2000%+. "
+                "建议关掉 use_diff (RevIN 已能单独解决数值外推) 或显式设 "
+                "use_revin=False.",
+                UserWarning, stacklevel=3,
+            )
+
+        if use_revin:
             affine = self.config.get('revin_affine', True)
             self.revin = RevIN(num_features=num_features, affine=affine)
         else:
@@ -1254,6 +1333,105 @@ class DLinear(_DLBaseModel):
         """
         alpha = 1 - confidence_level
         return [round(alpha / 2, 4), 0.5, round(1 - alpha / 2, 4)]
+
+    # ------------------------------------------------------------------
+    # 多目标 y 拼装 / 反拼装工具 — 与 forward 的 target-major flatten 对齐
+    # / Multi-target y packing utilities aligned with forward's target-major layout
+    # ------------------------------------------------------------------
+    @staticmethod
+    def pack_y(y_per_target: Sequence[np.ndarray]) -> np.ndarray:
+        """
+        把"每个 target 一个 (N, pred_len) 数组"打包成 forward 期望的
+        ``(N, num_targets * pred_len)`` **target-major flatten**.
+
+        内存顺序: ``[t0_h0..t0_h(H-1), t1_h0..t1_h(H-1), ...]`` —
+        与 DLinear.forward 末尾 ``out.view(B, -1)`` 完全一致.
+
+        ⚠ 用户不要自己 ``np.stack(..., axis=-1).reshape(N, -1)`` 拼 y —
+        那是 step-major 顺序, 训练 loss 会下降但**每个目标的预测错位**.
+
+        Args:
+            y_per_target: 长度 T 的列表/元组, 每项 shape (N, pred_len).
+
+        Returns:
+            (N, T * pred_len) 的二维数组.
+
+        Raises:
+            ValueError: y_per_target 长度为 0 或各项 shape 不一致.
+
+        Example::
+
+            y_t0 = np.random.rand(100, 12)   # 100 样本 × 12 步 × 目标0
+            y_t1 = np.random.rand(100, 12)
+            y_train = DLinear.pack_y([y_t0, y_t1])   # (100, 24)
+            model.fit((X_train, y_train), val_data=...)
+        """
+        if not y_per_target:
+            raise ValueError('pack_y: y_per_target 不能为空')
+        arrs = [np.asarray(a) for a in y_per_target]
+        ref_shape = arrs[0].shape
+        for i, a in enumerate(arrs):
+            if a.shape != ref_shape:
+                raise ValueError(
+                    f'pack_y: y_per_target[{i}] shape {a.shape} '
+                    f'与 y_per_target[0] shape {ref_shape} 不一致.'
+                )
+        # (N, T, H) → (N, T*H) target-major flatten
+        stacked = np.stack(arrs, axis=1)
+        return stacked.reshape(stacked.shape[0], -1)
+
+    @staticmethod
+    def unpack_y(
+        y_flat: np.ndarray, num_targets: int, pred_len: int,
+    ) -> np.ndarray:
+        """
+        ``(N, num_targets * pred_len)`` flat → ``(N, num_targets, pred_len)`` 结构化.
+
+        ``pack_y`` 的精确反操作.
+        """
+        y_flat = np.asarray(y_flat)
+        N = y_flat.shape[0]
+        expected = num_targets * pred_len
+        if y_flat.shape[-1] != expected:
+            raise ValueError(
+                f'unpack_y: y_flat 末维 {y_flat.shape[-1]} != '
+                f'num_targets({num_targets}) * pred_len({pred_len}) = {expected}.'
+            )
+        return y_flat.reshape(N, num_targets, pred_len)
+
+    def predict_structured(self, test_data, **kwargs) -> np.ndarray:
+        """
+        结构化点预测: 返回 ``(N, num_targets, pred_len)`` 三维数组,
+        免去调用方自己 reshape ``predict()`` 的 flat 输出.
+        """
+        flat = self.predict(test_data, **kwargs)
+        return self.unpack_y(flat, self.num_targets, self.pred_len)
+
+    # ------------------------------------------------------------------
+    # fit override: y 形状校验, 早抛错指引用户走 pack_y
+    # / Override fit to validate y shape early
+    # ------------------------------------------------------------------
+    def fit(self, train_data, val_data=None, **kwargs) -> dict:
+        """DLinear.fit: 调用 _DLBaseModel.fit 前先校验 y 末维与 num_targets*pred_len 对齐."""
+        expected = self.num_targets * self.pred_len
+        for name, data in (('train_data', train_data), ('val_data', val_data)):
+            if data is None:
+                continue
+            try:
+                _, y = data
+            except Exception:
+                # 不是 (X, y) 元组, 让底层 _dl_fit 自己报错
+                continue
+            y_arr = np.asarray(y)
+            last = y_arr.shape[-1] if y_arr.ndim >= 1 else None
+            if last != expected:
+                raise ValueError(
+                    f"DLinear.fit: {name} 的 y 末维 = {last}, 期望 "
+                    f"num_targets({self.num_targets}) * pred_len({self.pred_len}) "
+                    f"= {expected}. 多目标场景请用 DLinear.pack_y([y_t0, y_t1, ...]) "
+                    f"按 target-major 顺序拼装 y; 不要自己 np.stack(axis=-1).reshape."
+                )
+        return super().fit(train_data, val_data, **kwargs)
 
     def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
         """

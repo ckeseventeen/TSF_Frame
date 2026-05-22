@@ -37,6 +37,7 @@ import json
 import os
 import sqlite3
 import threading
+import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
@@ -48,6 +49,8 @@ from .interfaces import (
     MetricStore,
     register_store,
 )
+
+logger = logging.getLogger(__name__)
 
 __all__ = ['InMemoryStore', 'SQLiteStore', 'JsonlStore']
 
@@ -441,7 +444,12 @@ class SQLiteStore(MetricStore):
                     continue
                 try:
                     details = json.loads(r['details']) if r['details'] else {}
-                except Exception:
+                except Exception as exc:
+                    # alert.details 列里存的 JSON 损坏 — 不影响主流程, 留 debug 让排查时有线索
+                    logger.debug(
+                        "SQLiteStore._fetch_alerts: alert_id=%s 的 details 解析失败 (%s); "
+                        "返回空 dict.", r.get('alert_id'), exc,
+                    )
                     details = {}
                 out.append(Alert(
                     alert_id=r['alert_id'],
@@ -525,7 +533,11 @@ class JsonlStore(MetricStore):
                     continue
                 try:
                     out.append(json.loads(line))
-                except Exception:
+                except Exception as exc:
+                    # JSONL 行损坏 (写入时进程被 kill / 文件被截断); 跳过本行不影响其它
+                    logger.debug(
+                        "JsonlStore._read_all: 跳过格式错误的 JSON 行 (%s).", exc,
+                    )
                     continue
         return out
 

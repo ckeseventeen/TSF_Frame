@@ -96,7 +96,8 @@ class BaseMLModel(BaseModel):
         pass
 
     def fit(self, train_data: Tuple[np.ndarray, np.ndarray],
-            val_data: Optional[Tuple[np.ndarray, np.ndarray]] = None, **kwargs) -> Dict[str, Any]:
+            val_data: Optional[Tuple[np.ndarray, np.ndarray]] = None,
+            cv_folds: int = 0, **kwargs) -> Dict[str, Any]:
         """
         训练模型 / Train the model.
 
@@ -157,16 +158,20 @@ class BaseMLModel(BaseModel):
             val_mse = MetricsCalculator.mse(y_val, y_val_pred)
             history['val_loss'] = [val_mse]
 
-        # 残差法概率预测: 优先用**验证集 OOS 残差**, 否则退化为训练集残差.
-        # 训练集残差对 XGBoost/RF 等过拟合模型会严重低估区间宽度 (CI 过窄, 过度自信);
-        # 验证集残差是 out-of-sample, 反映真实泛化误差, 区间更可信.
-        # 没有 val_data 时退化, 但**显式 warning** 让调用方知情, 并把残差来源标签
-        # ('train' vs 'val') 缓存到 self._residual_source 供监控/报表读.
+        # 残差法概率预测的 3 条路径, 优先级:
+        #   1. cv_folds > 0  → K-fold OOF 残差 (source='cv', 最严谨, 用满训练样本)
+        #   2. val_data 提供 → val OOS 残差 (source='val', 推荐默认)
+        #   3. 都没有       → train 残差 + warning (source='train', 易过度乐观)
         # 注意: 保持残差 2D (N, M), 不要 flatten — 否则多输出场景各维度
         # 量纲被混在一起, 区间会失真 (见 BaseModel._fit_residuals 文档).
-        # / Prefer OOS validation residuals; warn-and-fallback to training residuals.
+        # / Three residual paths in priority: cv > val > train.
         if self.probabilistic and self.probabilistic_method == 'residual':
-            if y_val_pred is not None:
+            if cv_folds and int(cv_folds) > 0:
+                oof = self._compute_cv_oof_predictions(
+                    X_train, y_train, n_splits=int(cv_folds), fit_kwargs=kwargs,
+                )
+                self._fit_residuals(y_train, oof, source='cv')
+            elif y_val_pred is not None:
                 # 推荐路径: OOS 残差 → 区间反映真实泛化误差
                 # y_val 形状对齐: 与训练侧一致, 1D 时 reshape 到 (Nv, 1)
                 y_val_arr = np.asarray(val_data[1])
@@ -180,14 +185,70 @@ class BaseMLModel(BaseModel):
                 y_train_pred = self.predict(X_train)
                 self._fit_residuals(y_train, y_train_pred, source='train')
                 _logger.warning(
-                    "%s: 残差法置信区间在缺少 val_data 时退化为**训练集残差**, "
-                    "对易过拟合模型 (XGBoost/RF/GBM) 会显著低估区间宽度 "
-                    "(过度自信 CI). 强烈建议在 fit() 中传入 val_data 以获得 "
-                    "OOS 残差区间; 或改用 probabilistic_method='quantile'.",
+                    "%s: 残差法置信区间在缺少 val_data / cv_folds 时退化为"
+                    "**训练集残差**, 对易过拟合模型 (XGBoost/RF/GBM) 会显著"
+                    "低估区间宽度. 建议传 val_data 或 cv_folds=5; 或改用 "
+                    "probabilistic_method='quantile'.",
                     self.__class__.__name__,
                 )
 
         return history
+
+    def _compute_cv_oof_predictions(
+        self,
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        n_splits: int,
+        fit_kwargs: Dict[str, Any],
+    ) -> np.ndarray:
+        """
+        K-fold OOF (out-of-fold) 预测, 用于残差法 OOS 置信区间.
+
+        时序数据**必须** shuffle=False, 否则训练集会泄露未来信息到验证 fold.
+        / Time-series KFold must be shuffle=False to avoid future leakage.
+
+        Args:
+            X_train:    (N, D)
+            y_train:    (N, M) — 已经被外层 reshape 过
+            n_splits:   折数 (建议 ≥ 3)
+            fit_kwargs: 透传给 sklearn fit 的额外参数
+
+        Returns:
+            (N, M) 的 OOF 预测数组; 与 y_train 同形, 用于算残差.
+        """
+        from sklearn.base import clone
+        from sklearn.model_selection import KFold
+        from sklearn.multioutput import MultiOutputRegressor
+
+        N = X_train.shape[0]
+        if N < n_splits * 2:
+            _logger.warning(
+                "%s: cv_folds=%d 但训练样本 %d 太少 (建议每折 ≥ 2 样本), "
+                "残差 CV 估计噪声大.",
+                self.__class__.__name__, n_splits, N,
+            )
+
+        oof = np.zeros_like(y_train, dtype=float)
+        kf = KFold(n_splits=n_splits, shuffle=False)
+        is_multi = y_train.shape[1] > 1
+
+        for fold_idx, (tr_idx, va_idx) in enumerate(kf.split(X_train), start=1):
+            base = self._build_model()
+            clone_est = MultiOutputRegressor(base) if is_multi else base
+
+            if is_multi:
+                clone_est.fit(X_train[tr_idx], y_train[tr_idx], **fit_kwargs)
+                pred = clone_est.predict(X_train[va_idx])
+            else:
+                clone_est.fit(
+                    X_train[tr_idx], y_train[tr_idx].ravel(), **fit_kwargs,
+                )
+                pred = clone_est.predict(X_train[va_idx])
+                if pred.ndim == 1:
+                    pred = pred.reshape(-1, 1)
+            oof[va_idx] = pred
+
+        return oof
 
     def _predict_probabilistic(self, test_data: Any, **kwargs) -> 'ProbabilisticPrediction':
         """

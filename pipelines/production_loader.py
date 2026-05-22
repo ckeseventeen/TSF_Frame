@@ -15,7 +15,6 @@
 
 from __future__ import annotations
 import logging
-import os
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -35,6 +34,10 @@ def get_default_config() -> DataSourceConfig:
     if _DEFAULT_CONFIG is None:
         _DEFAULT_CONFIG = DataSourceConfig()
         logger.info(f"DataSourceConfig 已初始化: {_DEFAULT_CONFIG.to_dict()}")
+    # 用 raise 而非 assert: python -O 模式 assert 会被 strip,
+    # 生产路径不能依赖 assert. / Use raise; assert is stripped under python -O.
+    if _DEFAULT_CONFIG is None:
+        raise RuntimeError("DataSourceConfig 初始化失败")
     return _DEFAULT_CONFIG
 
 
@@ -110,6 +113,7 @@ def _fetch_from_hive(sql_path: str, cfg: DataSourceConfig) -> pd.DataFrame:
         f"[Hive] 连接 {cfg.hive_host}:{cfg.hive_port}/{cfg.hive_database} "
         f"(auth={cfg.hive_auth})"
     )
+
     conn = hive.Connection(
         host=cfg.hive_host,
         port=cfg.hive_port,
@@ -120,6 +124,8 @@ def _fetch_from_hive(sql_path: str, cfg: DataSourceConfig) -> pd.DataFrame:
     )
     try:
         df = pd.read_sql(sql, conn)
+        if not isinstance(df, pd.DataFrame):
+            raise TypeError(f"pd.read_sql 意外返回 {type(df).__name__}, 期望 DataFrame")
     finally:
         conn.close()
     logger.info(f"[Hive] 加载 {len(df)} 行 × {len(df.columns)} 列")

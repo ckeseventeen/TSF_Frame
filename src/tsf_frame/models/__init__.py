@@ -14,6 +14,8 @@ from .classical.ml_models import (
     KNNModel,
     DecisionTreeModel
 )
+# 表格 / 横截面回归
+from .tabular import MLPModel
 
 __all__ = [
     'BaseModel',
@@ -29,5 +31,6 @@ __all__ = [
     'CatBoostModel',
     'SVRModel',
     'KNNModel',
-    'DecisionTreeModel'
+    'DecisionTreeModel',
+    'MLPModel',
 ]

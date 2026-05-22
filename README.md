@@ -5,8 +5,8 @@
 ```
 ┌─────────────┐   ┌──────────────┐   ┌────────────┐   ┌──────────────────┐
 │  业务适配层  │ → │  特征工程层   │ → │  模型层     │ → │  监控/告警/可视化  │
-│  (防腐层)    │   │              │   │  17 models │   │   pluggable      │
-│  HPFAdapter │   │  Time/Lag    │   │  ML + DL   │   │  ModelMonitor +  │
+│  (防腐层)    │   │              │   │  18 models │   │   pluggable      │
+│  HPFAdapter │   │  Time/Lag    │   │ ML+DL+MLP  │   │  ModelMonitor +  │
 │             │   │  Roll/Diff   │   │            │   │  规则/漂移/重训   │
 └─────────────┘   └──────────────┘   └────────────┘   └──────────────────┘
 ```
@@ -21,7 +21,7 @@ cd TSF_Frame
 pip install -e .
 
 # 端到端 HPF 预测
-python pipelines/run_hpf_forecast.py
+python pipelines/examples/run_hpf_forecast.py
 # → logs/outputs/hpf/*.png  (4 张对比图)
 # → 控制台输出 MAPE/R² 等指标
 
@@ -30,18 +30,26 @@ python pipelines/examples/hpf_monitoring_example.py
 # → logs/monitor/hpf_monitor.db   SQLite 三表
 # → logs/monitor/hpf_alerts.log   告警(WARNING+)
 # → logs/reports/hpf/*.png         报表
+
+# 生产推理 wrapper 演示(train → save → load → predict)
+python pipelines/examples/inference_demo.py
+# → logs/models/inference_demo_ridge.pkl   端到端 artifact
 ```
 
 ---
 
 ## 核心能力
 
-- **17 个模型** — 11 ML(`xgboost`/`lightgbm`/`catboost`/`ridge`/`svr`/...)+ 6 DL(`lstm`/`transformer`/`autoformer`/`itransformer`/`timesnet`/`dlinear`)
-- **概率预测** — 残差分布 / MC Dropout / 分位数回归,统一 `ProbabilisticPrediction` 接口
+- **18 个模型** — 11 ML(`xgboost`/`lightgbm`/`catboost`/`ridge`/`svr`/...)+ 6 DL 时序(`lstm`/`transformer`/`autoformer`/`itransformer`/`timesnet`/`dlinear`)+ `MLPModel` 横截面表格 + Moirai 零样本
+- **概率预测** — 残差分布(支持 train / val OOS / **K-fold CV OOF**)/ MC Dropout / 分位数回归,统一 `ProbabilisticPrediction` 接口
+- **RevIN 默认开** — 6 个 DL 模型都内置 Reversible Instance Normalization,长趋势数据 MAPE 从 6-20% 降到 ~0.5%(ICLR 2022)
+- **早停 + LR scheduling** — `_dl_fit` 可选 `early_stop_patience` / `lr_scheduler='plateau'|'cosine'`,自动节省 60-80% epoch
 - **特征工程** — 时间/滞后/滚动/扩展/差分 + KBest/RFE/Lasso/PCA,**严格 fit→transform 因果**
 - **业务防腐层** — `HPFAdapter` 把非负、季节、政策情景、YoY/QoQ 业务规则集中封装
 - **监控闭环** — `ModelMonitor` 组合性能/数据漂移/概念漂移/规则引擎/重训触发器/告警/持久化(全部可插拔)
 - **多目标 / 多步监控** — `MultiTargetMonitor`(温度+湿度并发)、`MultiHorizonMonitor`(未来 12 个月分桶 MAPE)
+- **生产推理 wrapper** — `tsf_frame.deployment.InferenceRunner` 把 5 个训练时状态打包成单一 artifact,推理一行 `.predict(latest_df)` 出预测,自动 anti-data-leakage
+- **推理协议 API** — `MixedFeatureHandler.min_required_rows` / `required_source_columns` 给 SQL 调用方做 defensive check
 - **统一画图** — `PredictionPlotter` 7 个原子方法 + 4 个复合工具,所有项目图风格统一
 - **运行时数据持久化** — `SQLiteStore` / `JsonlStore` / `InMemoryStore` 三选一,完整 schema
 
@@ -53,23 +61,28 @@ python pipelines/examples/hpf_monitoring_example.py
 TSF_Frame/
 ├── src/tsf_frame/              # 框架源码 (发布包)
 │   ├── business/               # BaseBusinessAdapter / HPFAdapter
-│   ├── features/               # engineering / selector
-│   ├── models/                 # classical / transformer / moirai
+│   ├── features/               # engineering / selector / mixed_feature_handler
+│   ├── models/                 # classical / transformer / tabular(MLP) / moirai
 │   ├── monitoring/             # 完整监控栈 (12 文件)
+│   ├── deployment/             # InferenceRunner (端到端 save/load/predict)
 │   ├── visualization/          # PredictionPlotter (统一画图)
 │   ├── data/datasets/
 │   └── utils/                  # logger / metrics
 ├── configs/                    # 顶层配置包 (BaseConfig + HPFConfig)
+│   └── hpf/                    # HPFConfig + task_registry + sql_templates/
 ├── pipelines/                  # 入口脚本
-│   ├── run_hpf_forecast.py     # HPF 端到端
+│   ├── run_monthly_controller.py  # 月度跑批主控 (遍历 TASKS)
+│   ├── production_loader.py    # 数据接入 (csv/hive) + 结果落库 (csv/mysql)
 │   ├── train_model.py          # 通用 CLI 训练器
-│   └── examples/               # 单模块演示
-├── tests/                      # pytest (54 个测试)
+│   ├── job_train.py / job_inference.py  # 单任务训练/推理
+│   └── examples/               # 单模块演示 + run_hpf_forecast 端到端
+├── tests/                      # pytest (100 个测试)
 ├── docs/                       # 文档
 ├── logs/                       # 运行产物 (gitignore)
 │   ├── runs/                   # 运行日志
 │   ├── monitor/                # SQLite + alerts.log
 │   ├── reports/                # 报表 PNG
+│   ├── models/                 # 训练好的 artifact (InferenceRunner.save)
 │   └── outputs/                # 训练产出
 ├── setup.py
 └── requirements.txt
@@ -84,25 +97,35 @@ TSF_Frame/
 pip install -e .
 
 # 端到端 HPF 预测 (4 张对比图)
-python pipelines/run_hpf_forecast.py
+python pipelines/examples/run_hpf_forecast.py
 
 # HPF 监控完整演示 (规则 + 漂移 + 告警 + 报表)
 python pipelines/examples/hpf_monitoring_example.py
+
+# 6 个 DL 模型对比 (含 RevIN + 早停 + LR scheduling)
+python pipelines/examples/hpf_dl_example.py
+
+# 生产推理 wrapper (train → save → reload → predict)
+python pipelines/examples/inference_demo.py
+
+# 月度跑批主控 (遍历 TASKS,csv 兜底 / hive 生产)
+python pipelines/run_monthly_controller.py
 
 # 通用训练器
 python pipelines/train_model.py --model ridge   --dataset air_passengers
 python pipelines/train_model.py --model xgboost --dataset synthetic
 python pipelines/train_model.py --model lstm    --dataset air_passengers --epochs 20
 
-# 单模块演示
+# 其他单模块演示
 python pipelines/examples/feature_engineering_example.py
 python pipelines/examples/probabilistic_example.py
-python pipelines/examples/hpf_dl_example.py
+python pipelines/examples/panel_income_spending_example.py   # 面板数据 + DLinear 多目标
 python pipelines/examples/public_dataset_workflow.py
 
 # 测试
-pytest tests/             # 54 passed
+pytest tests/             # 147 passed
 pytest tests/ -v
+pytest tests/test_improvements_tier_ab.py    # 16 个生产化改进项单测
 ```
 
 ---
@@ -167,11 +190,37 @@ print(status.alert_level, status.recommendations)
 
 ---
 
+## 生产推理 (InferenceRunner)
+
+把训练时分散在多个对象里的状态打包成单一 artifact,推理一行调用,自动 anti-data-leakage:
+
+```python
+from tsf_frame.deployment import InferenceRunner
+
+# 训练完: 打包 5 个状态(adapter / feat_eng / mfh / model / model_config)落盘
+runner = InferenceRunner(
+    adapter=adapter, feat_eng=feat_eng, mfh=mfh,
+    model=model, model_config=model.config, target_col='monthly_deposit',
+)
+runner.save('logs/models/hpf_ridge_v1.pkl')
+
+# 推理(可同进程也可新进程):
+runner = InferenceRunner.load('logs/models/hpf_ridge_v1.pkl', model_cls=RidgeModel)
+prob = runner.predict(latest_24_months_df, target_col='monthly_deposit')
+print(f'预测: {prob.mean[0]:.2f}, 95% CI: [{prob.lower[0]:.2f}, {prob.upper[0]:.2f}]')
+```
+
+`load` 自动设 `adapter._is_fitted=True`、`predict` 入口 assert `len(latest_df) >= min_required_rows`、全链路 `fit=False` — 调用方想错也错不了。
+
+---
+
 ## 当前状态
 
 - Python 3.8+ · Windows / Linux / macOS
-- 版本 0.2.0 · 测试 **54 passed**
-- HPF baseline (Ridge): MAPE ~1% · R² ~0.99 (12 年模拟月度数据)
+- 版本 0.2.0 · 测试 **147 passed**(含 16 个 Tier A+B + 47 个 registry/multi_horizon/edge_cases 改进项单测)
+- HPF baseline:
+  - ML (Ridge): MAPE ~1% · R² ~0.95 (12 年模拟月度数据)
+  - DL (RevIN + 早停): 6 个 Transformer 系列模型 test MAPE ~0.5%
 
 ## Moirai 零样本大模型 (Zero-Shot Foundation Model)
 

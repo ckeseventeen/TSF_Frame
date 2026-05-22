@@ -110,6 +110,77 @@ class MixedFeatureHandler:
                 "Handler has not been fitted. Call handler.fit(train_df) first."
             )
 
+    # ------------------------------------------------------------------
+    # 推理协议 API — 给调用方(SQL/Kafka/API)写 LIMIT/SELECT 时用
+    # / Inference protocol APIs — for callers writing SQL LIMIT / SELECT
+    # ------------------------------------------------------------------
+    @property
+    def required_source_columns(self) -> List[str]:
+        """
+        SQL 必须 SELECT 的原始列(目标 + 时变协变量 + 静态),用于 defensive check.
+
+        调用方(如 run_monthly_controller)拉 SQL 时应该:
+            cols = handler.required_source_columns
+            sql = f"SELECT {', '.join(cols)}, ts FROM ... WHERE ..."
+
+        Returns:
+            去重后的列名列表; 顺序: [target_col] + (time_varying_cols 去 target) + static_cols
+        """
+        cols = [self.target_col]
+        cols.extend(c for c in self.time_varying_cols if c != self.target_col)
+        if self.static_cols:
+            cols.extend(c for c in self.static_cols if c not in cols)
+        return cols
+
+    def min_required_rows(self, feature_engineer=None) -> int:
+        """
+        推理时输入 DataFrame 至少需要多少行 — 用于 SQL LIMIT / defensive assert.
+
+        计算: ``seq_len + feature_lookback - 1`` (最小 seq_len)
+        其中 ``feature_lookback`` 来自上游 feature_engineer 的 lag/rolling 最大回看;
+        若调用方没传 feature_engineer, 则只保证 seq_len 个窗口可用 (假设 df 已 transform 过).
+
+        Args:
+            feature_engineer: 可选的 (Composite)FeatureEngineer 实例;
+                              若传入会读取其 lag/window/period 最大值并加到 lookback.
+
+        Returns:
+            ``max(seq_len, seq_len + feature_lookback - 1)``
+
+        Example::
+
+            handler = MixedFeatureHandler(..., seq_len=12)
+            feat_eng = create_feature_engineer(['lag', 'rolling'], config=...)
+            assert len(df) >= handler.min_required_rows(feature_engineer=feat_eng)
+        """
+        lookback = self._max_lookback_of_engineer(feature_engineer)
+        # seq_len 是 sliding window 自身需求; lookback 是上游算 lag/rolling 时
+        # 会让前 N 行 NaN 被丢, 所以多拉 lookback - 1 行兜底.
+        return self.seq_len + max(0, lookback - 1) if lookback > 0 else self.seq_len
+
+    @staticmethod
+    def _max_lookback_of_engineer(engineer) -> int:
+        """
+        遍历 (Composite)FeatureEngineer, 取 lag/rolling/diff 最大回看长度.
+
+        约定:
+          - LagFeatureEngineer.lags        (list[int])
+          - RollingFeatureEngineer.windows (list[int])
+          - DifferenceFeatureEngineer.periods (list[int])
+          - CompositeFeatureEngineer.engineers (list of above)
+        """
+        if engineer is None:
+            return 0
+        # Composite: 递归
+        sub_engineers = getattr(engineer, 'engineers', [engineer])
+        max_lb = 0
+        for eng in sub_engineers:
+            for attr in ('lags', 'windows', 'periods'):
+                vals = getattr(eng, attr, None)
+                if vals:
+                    max_lb = max(max_lb, int(max(vals)))
+        return max_lb
+
     def transform(self, df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
         """
         合并时序特征与静态特征（类比 scaler.transform，可用于任意数据集）。

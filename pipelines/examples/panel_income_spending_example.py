@@ -243,21 +243,26 @@ def build_windows(df: pd.DataFrame, static_cols: list[str],
             # DL 路径: 把静态在每个时间步重复, 拼到时变右侧 → (L, C_static + 2)
             x_full = np.concatenate(
                 [np.tile(static_vec, (L, 1)), x_time], axis=1)
-            # y: 未来 H 步 (income_z, spending_z), 拆成两条再 target-major 拼接
+            # y: 未来 H 步 (income, spending) 各自 (H,), 拼装见下面 pack_y
             y_inc  = timev[start + L: start + L + H, 0]        # (H,)
             y_spe  = timev[start + L: start + L + H, 1]        # (H,)
-            y_flat = np.concatenate([y_inc, y_spe])             # (T*H,)
 
             timev_seqs.append(x_full)
             static_arrs.append(static_vec)
-            y_seqs.append(y_flat)
+            y_seqs.append((y_inc, y_spe))   # 暂存 tuple, 最后用 DLinear.pack_y 统一拼
 
     X3d = np.stack(timev_seqs, axis=0).astype(np.float32)        # (N, L, C_in)
     static_mat = np.stack(static_arrs, axis=0).astype(np.float32)
     # ML flatten: 静态只放一次 + 时变 (L 步 × 2 目标) flatten
     timev_flat = X3d[:, :, len(static_cols):].reshape(X3d.shape[0], -1)
     X_ml = np.concatenate([static_mat, timev_flat], axis=1)
-    y = np.stack(y_seqs, axis=0).astype(np.float32)
+
+    # 用 DLinear.pack_y 拼 y, target-major flatten — 与 DLinear forward 输出顺序对齐.
+    # / Use DLinear.pack_y to ensure target-major flatten matching forward output.
+    from tsf_frame.models.transformer.transformer_models import DLinear
+    y_inc_all = np.stack([t[0] for t in y_seqs], axis=0).astype(np.float32)   # (N, H)
+    y_spe_all = np.stack([t[1] for t in y_seqs], axis=0).astype(np.float32)   # (N, H)
+    y = DLinear.pack_y([y_inc_all, y_spe_all])                                # (N, T*H)
     return X3d, X_ml, y
 
 

@@ -476,6 +476,14 @@ def main():
         'use_revin': True,                    # 显式开启 RevIN (可逆实例归一化)
         # RevIN (ICLR 2022) 已经在 _DLBaseModel **默认开启** (use_revin=True),
         # 长趋势 HPF 数据上 RevIN 把 5 个 Transformer 系列 MAPE 从 6-20% 降到 ~0.5%.
+        # 早停 + LR 调度 — 避免 80 epoch 跑满过拟合, HPF 月度数据量小尤其需要
+        # patience=30 让 RevIN 模型有空间精细化 (实测 patience=15 过早截断, MAPE 1.3% 而非 0.5%)
+        # / Early stopping + LR scheduling for small HPF monthly data
+        'early_stop_patience': 30,
+        'early_stop_min_delta': 1e-6,
+        'lr_scheduler': 'plateau',
+        'lr_factor': 0.5,
+        'lr_plateau_patience': 8,
     }
 
     models_to_compare = ['lstm', 'transformer', 'autoformer',
@@ -509,6 +517,10 @@ def main():
             # 默认 True 与 _DLBaseModel._init_revin 默认值保持一致.
             # / RevIN and use_diff are mutually exclusive — default mirrors _DLBaseModel.
             use_diff = (not cfg.get('use_revin', True)) and (model_name not in {'dlinear', 'itransformer'})
+            # 把 use_diff 决策回写到 cfg, 让 _DLBaseModel._init_revin 守卫
+            # 检测到 use_revin + use_diff 同开时 warning.
+            # / Feed use_diff back into cfg so _DLBaseModel._init_revin can warn on conflict.
+            cfg['_train_uses_diff_target'] = use_diff
             res = train_and_evaluate_dl(
                 model_name, cfg,
                 X_train, y_train,

@@ -11,4 +11,8 @@
 """
 
 __version__ = '0.2.0'
-__all__ = ['__version__']
+
+# 顶层便捷导出 / Top-level convenience exports
+from .deployment import InferenceRunner
+
+__all__ = ['__version__', 'InferenceRunner']
