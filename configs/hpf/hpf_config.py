@@ -58,6 +58,10 @@ class HPFModelConfig:
     # 推荐首选：月度小数据集树模型效果好、训练快、可解释
     model_name: str = 'xgboost'
 
+    # 自动选模候选列表 (可选): 非空时 job_train 训练这些 ML 模型并按验证集 MAE 择优,
+    # 为空时退回单模型 model_name (向后兼容). 仅支持 classical ML 模型名.
+    candidate_models: List[str] = field(default_factory=list)
+
     # 回看 24 个月（捕捉 2 个年度周期）
     seq_len: int = 24
     # 预测步数（1=下月, 3=季度预测, 12=年度预测）

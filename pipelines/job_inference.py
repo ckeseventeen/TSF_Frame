@@ -26,7 +26,7 @@ def _load_diff_flag(model_path: str) -> dict:
             return pickle.load(f)
     except FileNotFoundError:
         logger.warning(f"No diff_flag file found at {diff_flag_path}, assuming no diff")
-        return {'use_diff': False, 'last_train_value': 0.0, 'feature_cols': []}
+        return {'use_diff': False, 'last_train_value': 0.0, 'feature_cols': [], 'model_name': None}
 
 
 def run_future_forecast(recent_df, config, model_path, adapter, meta=None):
@@ -73,7 +73,10 @@ def run_future_forecast(recent_df, config, model_path, adapter, meta=None):
     )
 
     # 5. 加载模型
-    model = get_ml_model(config.model.model_name, config.to_model_config())
+    #    用训练时**实际选中**的模型名 (自动选模可能选了非 config.model_name 的候选);
+    #    缺失时回退 config.model_name (向后兼容旧 diff_flag).
+    infer_model_name = diff_flag.get('model_name') or config.model.model_name
+    model = get_ml_model(infer_model_name, config.to_model_config())
     model.load_model(model_path)
 
     # 6. 滚动外推核心逻辑

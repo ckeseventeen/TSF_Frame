@@ -24,8 +24,9 @@ from typing import Optional
 
 # 确保项目根目录在 sys.path
 _HERE = Path(__file__).resolve()
-sys.path.insert(0, str(_HERE.parents[1] / 'src'))
-sys.path.insert(0, str(_HERE.parents[1]))
+_PROJECT_ROOT = _HERE.parents[1]
+sys.path.insert(0, str(_PROJECT_ROOT / 'src'))
+sys.path.insert(0, str(_PROJECT_ROOT))
 
 from tsf_frame.business.hpf_adapter import HPFAdapter
 from tsf_frame.monitoring import ModelMonitor, SQLiteStore
@@ -42,7 +43,7 @@ from pipelines.job_inference import run_future_forecast
 
 
 def main(data_source_config: Optional[DataSourceConfig] = None) -> None:
-    logger = get_logger('monthly_batch', log_dir='logs/runs')
+    logger = get_logger('monthly_batch', log_dir=str(_PROJECT_ROOT / 'logs' / 'runs'))
     logger.info("Starting monthly batch process...")
 
     # 1. 数据源配置 —— 显式传入优先, 否则按环境变量初始化
@@ -52,7 +53,7 @@ def main(data_source_config: Optional[DataSourceConfig] = None) -> None:
     logger.info(f"DataSource: {ds_cfg.to_dict()}")
 
     # 2. 初始化监控存储
-    store = SQLiteStore('logs/monitor/hpf_monitor.db')
+    store = SQLiteStore(str(_PROJECT_ROOT / 'logs' / 'monitor' / 'hpf_monitor.db'))
 
     for task in TASKS:
         task_id = task['task_id']
@@ -120,7 +121,7 @@ def main(data_source_config: Optional[DataSourceConfig] = None) -> None:
 
             # 5. 持续训练决策 (CT) —— 不存在 OR warning/critical 时重训
             #    AlertLevel 用小写字符串常量 (见 monitoring.interfaces.AlertLevel)
-            model_path = f"logs/models/{task_id}_best.pkl"
+            model_path = str(_PROJECT_ROOT / 'logs' / 'models' / f"{task_id}_best.pkl")
             need_retrain = (
                 not os.path.exists(model_path)
                 or status.alert_level in ('warning', 'critical')

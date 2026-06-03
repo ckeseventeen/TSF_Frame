@@ -37,7 +37,9 @@ def get_collection_prediction_config() -> HPFConfig:
     cfg.features.rolling_windows = [3, 6, 12]
 
     # 4. 模型与预测步数 (未来 60 个月)
-    cfg.model.model_name = 'xgboost'
+    cfg.model.model_name = 'xgboost'   # 单模型兜底 (candidate_models 为空时用)
+    # 自动选模: 每月重训时横比这些候选, 按验证集 MAE 择优落盘
+    cfg.model.candidate_models = ['xgboost', 'random_forest', 'ridge']
     cfg.model.pred_len = 60
 
     # 5. 监控报警阈值 (10%)

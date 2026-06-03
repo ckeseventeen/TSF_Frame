@@ -183,6 +183,12 @@ plot/
 /logs/*.log
 /logs/*.db
 /logs/hpf_reports/
+# 运行产物子目录: 模型权重 / 监控 DB / 预测输出 / 运行日志 —— 都不入库
+# (之前漏了这些, 导致 demo 模型与 hpf_monitor.db 被跟踪, 反复制造 git 噪音)
+/logs/models/
+/logs/monitor/
+/logs/outputs/
+/logs/runs/
 
 # 安装元数据
 *.egg-info/

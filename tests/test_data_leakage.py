@@ -21,7 +21,7 @@ from tsf_frame.features.engineering import (
 @pytest.fixture()
 def toy_series() -> pd.DataFrame:
     """y = [0, 1, 2, ..., 23] 单调递增, 异常值容易被 lag/rolling 暴露."""
-    idx = pd.date_range('2020-01-01', periods=24, freq='ME')
+    idx = pd.date_range('2020-01-01', periods=24, freq='MS')
     return pd.DataFrame({'y': np.arange(24, dtype=float)}, index=idx)
 
 

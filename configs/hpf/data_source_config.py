@@ -129,3 +129,9 @@ class DataSourceConfig:
             scheme, creds = head.split('://', 1)
             return f"{scheme}://***@{tail}"
         return f"***@{tail}"
+
+
+if __name__ == '__main__':
+    data_source_config = DataSourceConfig()
+    print(f"data_source_config:{data_source_config}")
+    print(f"dict:{data_source_config.to_dict()}"      )

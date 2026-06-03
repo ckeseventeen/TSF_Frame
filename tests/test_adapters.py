@@ -9,7 +9,7 @@ from tsf_frame.business.hpf_adapter import HPFAdapter
 
 @pytest.fixture()
 def tiny_df() -> pd.DataFrame:
-    rng = pd.date_range('2020-01-31', periods=36, freq='ME')
+    rng = pd.date_range('2020-01-01', periods=36, freq='MS')
     rs = np.random.RandomState(0)
     return pd.DataFrame({
         'date': rng,
